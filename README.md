@@ -1,0 +1,30 @@
+# AGV device telemetry agent
+
+A dependency-free Python 3 systemd daemon for Linux/Raspberry Pi. It samples CPU, memory, root-disk usage, CPU temperature and 1-minute load every five seconds, then uploads a batch every five minutes. Unsent readings are stored in `/var/lib/agv-monitor/` and retry after networking/server failures.
+
+The five-second default is intentional: it produces 60 samples per five-minute upload. The server accepts up to 90 samples, leaving 50% headroom for a delayed upload.
+
+## Install on each device
+
+Copy this directory to the device and run:
+
+```sh
+sudo ./install.sh
+sudoedit /etc/agv-monitor/telemetry.conf
+sudo ./install.sh
+sudo systemctl status agv-monitor
+```
+
+Set `SERVER_URL` and the device's unique `DEVICE_TOKEN` in that config. The token must be provisioned for the Pi's current source IP address; the server rejects a token used from any other IP.
+
+## Useful checks
+
+```sh
+sudo journalctl -u agv-monitor -f
+sudo systemctl restart agv-monitor
+sudo systemctl status agv-monitor
+```
+
+The service has no third-party dependencies and runs as root only because the unit's filesystem hardening requires a root-managed configuration and state directory. The process itself only reads `/proc` and `/sys`, and writes its queue under `/var/lib/agv-monitor`.
+
+If you change the sampling interval to below five seconds, increase the upload cadence too: the server accepts no more than 90 readings per request. After an outage, the agent drains queued readings in consecutive 90-reading requests once the server is available.

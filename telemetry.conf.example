@@ -1,0 +1,23 @@
+# Per-device configuration. Copy this to /etc/agv-monitor/telemetry.conf and
+# restrict it to root because it contains the bearer token.
+
+# URL of the server endpoint (HTTPS is strongly recommended).
+SERVER_URL=https://monitor.example.com/api/v1/telemetry
+
+# This device's token, provisioned with its matching IP address on the server.
+DEVICE_TOKEN=replace-with-device-token
+
+# Five seconds creates 60 samples in each normal five-minute upload. The
+# server permits up to 90 samples to provide delayed-upload headroom.
+SAMPLE_INTERVAL_SECONDS=5
+UPLOAD_INTERVAL_SECONDS=300
+
+# Filesystem whose usage should be reported.
+DISK_PATH=/
+
+# Durable local queue for data collected while the server is unreachable.
+SPOOL_PATH=/var/lib/agv-monitor/telemetry-spool.jsonl
+# Seven days at the default sampling rate. The oldest readings are discarded
+# only if this ceiling is reached during a prolonged outage.
+MAX_SPOOL_SAMPLES=120960
+HTTP_TIMEOUT_SECONDS=20
