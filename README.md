@@ -4,6 +4,10 @@ A dependency-free Python 3 systemd daemon for Linux/Raspberry Pi. It samples CPU
 
 The five-second default is intentional: it produces 60 samples per five-minute upload. The server accepts up to 90 samples, leaving 50% headroom for a delayed upload.
 
+After a daemon start, the first upload occurs after the second sample (five
+seconds with the default configuration). This gives CPU and network utilisation
+enough counter history to report meaningful percentages immediately.
+
 ## Install on each device
 
 Copy this directory to the device and run:

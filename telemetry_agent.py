@@ -246,7 +246,10 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop_handler)
     previous_cpu = None
     previous_network = None
-    next_sample = next_upload = time.monotonic()
+    next_sample = time.monotonic()
+    # CPU and network utilisation are rates. Wait for the second collection
+    # before the first upload so the dashboard never receives a baseline 0/—.
+    next_upload = next_sample + sample_every
     while not STOP_REQUESTED:
         now = time.monotonic()
         if now >= next_sample:
