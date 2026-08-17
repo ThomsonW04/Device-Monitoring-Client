@@ -116,23 +116,32 @@ def cpu_temperature() -> float | None:
 
 def network_utilisation(
     previous: dict[str, tuple[int, int, float]] | None,
-) -> tuple[dict[str, float | None], dict[str, tuple[int, int, float]]]:
+) -> tuple[
+    dict[str, float | None], dict[str, bool], dict[str, tuple[int, int, float]]
+]:
     """Return combined RX/TX use as a percentage of each interface link speed."""
     now = time.monotonic()
     current: dict[str, tuple[int, int, float]] = {}
     utilisation: dict[str, float | None] = {}
+    link_up: dict[str, bool] = {}
     for interface in NETWORK_INTERFACES:
         base = Path("/sys/class/net") / interface
         try:
             rx_bytes = int((base / "statistics/rx_bytes").read_text(encoding="utf-8").strip())
             tx_bytes = int((base / "statistics/tx_bytes").read_text(encoding="utf-8").strip())
-            speed_mbps = int((base / "speed").read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
             utilisation[interface] = None
+            link_up[interface] = False
             continue
+        try:
+            link_up[interface] = (base / "carrier").read_text(encoding="utf-8").strip() == "1"
+            speed_mbps = int((base / "speed").read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            link_up[interface] = False
+            speed_mbps = 0
         current[interface] = (rx_bytes, tx_bytes, now)
         old = previous.get(interface) if previous else None
-        if old is None or speed_mbps <= 0:
+        if old is None or not link_up[interface] or speed_mbps <= 0:
             utilisation[interface] = None
             continue
         transferred_bytes = (rx_bytes - old[0]) + (tx_bytes - old[1])
@@ -142,7 +151,7 @@ def network_utilisation(
             continue
         percent = transferred_bytes * 8 * 100 / (elapsed * speed_mbps * 1_000_000)
         utilisation[interface] = round(max(0.0, min(100.0, percent)), 2)
-    return utilisation, current
+    return utilisation, link_up, current
 
 
 def collect(
@@ -151,7 +160,7 @@ def collect(
     disk_path: str,
 ) -> tuple[dict, tuple[int, int], dict[str, tuple[int, int, float]]]:
     cpu, current_cpu = cpu_percent(previous_cpu)
-    network, current_network = network_utilisation(previous_network)
+    network, link_up, current_network = network_utilisation(previous_network)
     try:
         load = round(os.getloadavg()[0], 2)
     except OSError:
@@ -165,6 +174,8 @@ def collect(
         "load_1m": load,
         "eth0_percent": network["eth0"],
         "eth1_percent": network["eth1"],
+        "eth0_link_up": link_up["eth0"],
+        "eth1_link_up": link_up["eth1"],
         "extra": {"hostname": socket.gethostname()},
     }, current_cpu, current_network
 

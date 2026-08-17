@@ -1,6 +1,6 @@
 # AGV device telemetry agent
 
-A dependency-free Python 3 systemd daemon for Linux/Raspberry Pi. It samples CPU, memory, root-disk usage, CPU temperature, 1-minute load, and `eth0`/`eth1` network utilisation every five seconds, then uploads a batch every five minutes. Network utilisation is combined receive/send traffic as a percentage of the interface's negotiated link speed. Unsent readings are stored in `/var/lib/agv-monitor/` and retry after networking/server failures.
+A dependency-free Python 3 systemd daemon for Linux/Raspberry Pi. It samples CPU, memory, root-disk usage, CPU temperature, 1-minute load, and `eth0`/`eth1` network utilisation every five seconds, then uploads a batch every five minutes. Network utilisation is combined receive/send traffic as a percentage of the interface's negotiated link speed. It also reports each port's physical carrier state, allowing the server to alert when a cable or interface goes down. Unsent readings are stored in `/var/lib/agv-monitor/` and retry after networking/server failures.
 
 The five-second default is intentional: it produces 60 samples per five-minute upload. The server accepts up to 90 samples, leaving 50% headroom for a delayed upload.
 
