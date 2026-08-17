@@ -32,6 +32,7 @@ DEFAULTS = {
     "HTTP_TIMEOUT_SECONDS": "20",
 }
 MAX_BATCH_SIZE = 90  # The server API's explicit maximum.
+NETWORK_INTERFACES = ("eth0", "eth1")
 STOP_REQUESTED = False
 
 
@@ -113,8 +114,44 @@ def cpu_temperature() -> float | None:
     return None
 
 
-def collect(previous_cpu: tuple[int, int] | None, disk_path: str) -> tuple[dict, tuple[int, int]]:
+def network_utilisation(
+    previous: dict[str, tuple[int, int, float]] | None,
+) -> tuple[dict[str, float | None], dict[str, tuple[int, int, float]]]:
+    """Return combined RX/TX use as a percentage of each interface link speed."""
+    now = time.monotonic()
+    current: dict[str, tuple[int, int, float]] = {}
+    utilisation: dict[str, float | None] = {}
+    for interface in NETWORK_INTERFACES:
+        base = Path("/sys/class/net") / interface
+        try:
+            rx_bytes = int((base / "statistics/rx_bytes").read_text(encoding="utf-8").strip())
+            tx_bytes = int((base / "statistics/tx_bytes").read_text(encoding="utf-8").strip())
+            speed_mbps = int((base / "speed").read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            utilisation[interface] = None
+            continue
+        current[interface] = (rx_bytes, tx_bytes, now)
+        old = previous.get(interface) if previous else None
+        if old is None or speed_mbps <= 0:
+            utilisation[interface] = None
+            continue
+        transferred_bytes = (rx_bytes - old[0]) + (tx_bytes - old[1])
+        elapsed = now - old[2]
+        if transferred_bytes < 0 or elapsed <= 0:
+            utilisation[interface] = None
+            continue
+        percent = transferred_bytes * 8 * 100 / (elapsed * speed_mbps * 1_000_000)
+        utilisation[interface] = round(max(0.0, min(100.0, percent)), 2)
+    return utilisation, current
+
+
+def collect(
+    previous_cpu: tuple[int, int] | None,
+    previous_network: dict[str, tuple[int, int, float]] | None,
+    disk_path: str,
+) -> tuple[dict, tuple[int, int], dict[str, tuple[int, int, float]]]:
     cpu, current_cpu = cpu_percent(previous_cpu)
+    network, current_network = network_utilisation(previous_network)
     try:
         load = round(os.getloadavg()[0], 2)
     except OSError:
@@ -126,8 +163,10 @@ def collect(previous_cpu: tuple[int, int] | None, disk_path: str) -> tuple[dict,
         "disk_percent": disk_percent(disk_path),
         "cpu_temp_c": cpu_temperature(),
         "load_1m": load,
+        "eth0_percent": network["eth0"],
+        "eth1_percent": network["eth1"],
         "extra": {"hostname": socket.gethostname()},
-    }, current_cpu
+    }, current_cpu, current_network
 
 
 def append_sample(spool_path: Path, sample: dict, maximum_samples: int) -> None:
@@ -157,7 +196,7 @@ def pending_samples(spool_path: Path) -> list[dict]:
 def rewrite_spool(spool_path: Path, samples: list[dict]) -> None:
     temporary = spool_path.with_suffix(spool_path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8") as spool:
-        for sample in remaining:
+        for sample in samples:
             spool.write(json.dumps(sample, separators=(",", ":")) + "\n")
         spool.flush()
         os.fsync(spool.fileno())
@@ -206,12 +245,15 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop_handler)
     signal.signal(signal.SIGINT, stop_handler)
     previous_cpu = None
+    previous_network = None
     next_sample = next_upload = time.monotonic()
     while not STOP_REQUESTED:
         now = time.monotonic()
         if now >= next_sample:
             try:
-                sample, previous_cpu = collect(previous_cpu, config["DISK_PATH"])
+                sample, previous_cpu, previous_network = collect(
+                    previous_cpu, previous_network, config["DISK_PATH"]
+                )
                 append_sample(Path(config["SPOOL_PATH"]), sample, int(config["MAX_SPOOL_SAMPLES"]))
             except (OSError, ValueError, KeyError) as error:
                 LOG.exception("Unable to collect telemetry: %s", error)

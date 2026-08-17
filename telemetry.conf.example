@@ -21,3 +21,6 @@ SPOOL_PATH=/var/lib/agv-monitor/telemetry-spool.jsonl
 # only if this ceiling is reached during a prolonged outage.
 MAX_SPOOL_SAMPLES=120960
 HTTP_TIMEOUT_SECONDS=20
+
+# Network utilisation is calculated for eth0 and eth1 from their RX/TX byte
+# counters and negotiated link speeds. An absent or disconnected port reports —.
