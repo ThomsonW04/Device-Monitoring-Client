@@ -10,12 +10,15 @@ Copy this directory to the device and run:
 
 ```sh
 sudo ./install.sh
-sudoedit /etc/agv-monitor/telemetry.conf
-sudo ./install.sh
 sudo systemctl status agv-monitor
 ```
 
-Set `SERVER_URL` and the device's unique `DEVICE_TOKEN` in that config. The token must be provisioned for the Pi's current source IP address; the server rejects a token used from any other IP.
+On its first run the installer prompts for `SERVER_URL`, the device's unique
+`DEVICE_TOKEN`, and collection settings before starting the service. The token
+entry is hidden while you type. The resulting root-only configuration remains
+at `/etc/agv-monitor/telemetry.conf`; the installer never overwrites an
+existing configuration. The token must be provisioned for the Pi's current
+source IP address; the server rejects a token used from any other IP.
 
 ## Useful checks
 
