@@ -33,7 +33,7 @@ install -m 0755 telemetry_agent.py /usr/local/lib/agv-monitor/telemetry_agent.py
 install -m 0644 agv-monitor.service /etc/systemd/system/agv-monitor.service
 if [ ! -f /etc/agv-monitor/telemetry.conf ]; then
     echo 'Configure this device (press Enter to accept a displayed default).'
-    server_url=$(prompt_value 'Server telemetry URL' 'https://monitor.example.com/api/v1/telemetry')
+    server_url=$(prompt_value 'Server telemetry URL' 'http://monitor.example.com:8080/api/v1/telemetry')
     device_token=$(prompt_secret 'Device token')
     if [ -z "$device_token" ]; then
         echo 'A device token is required; configuration was not created.' >&2
