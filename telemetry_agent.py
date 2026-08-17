@@ -96,11 +96,50 @@ def memory_percent() -> float:
     return round((total - available) * 100 / total, 1)
 
 
+def swap_percent() -> float:
+    """Return used swap as a percentage, or zero when swap is unavailable."""
+    values: dict[str, int] = {}
+    for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+        key, value = line.split(":", 1)
+        values[key] = int(value.split()[0])
+    total = values.get("SwapTotal", 0)
+    free = values.get("SwapFree", 0)
+    return round((total - free) * 100 / total, 1) if total else 0.0
+
+
+def uptime_seconds() -> int:
+    """Return elapsed seconds since the Linux kernel last booted."""
+    return int(float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0]))
+
+
 def disk_percent(path: str) -> float:
     stats = os.statvfs(path)
     total = stats.f_blocks * stats.f_frsize
     available = stats.f_bavail * stats.f_frsize
     return round((total - available) * 100 / total, 1) if total else 0.0
+
+
+def disk_io_percent(
+    previous: tuple[int, float] | None,
+    path: str,
+) -> tuple[float | None, tuple[int, float] | None]:
+    """Return disk active-time percentage using the kernel's I/O busy counter."""
+    device = os.stat(path).st_dev
+    stat_path = Path("/sys/dev/block") / f"{os.major(device)}:{os.minor(device)}" / "stat"
+    try:
+        fields = stat_path.read_text(encoding="utf-8").split()
+        busy_ms = int(fields[9])  # Linux diskstats field 10: time doing I/O.
+    except (OSError, ValueError, IndexError):
+        return None, None
+
+    current = (busy_ms, time.monotonic())
+    if previous is None:
+        return None, current
+    busy_delta = busy_ms - previous[0]
+    elapsed = current[1] - previous[1]
+    if busy_delta < 0 or elapsed <= 0:
+        return None, current
+    return round(max(0.0, min(100.0, busy_delta / (elapsed * 10))), 2), current
 
 
 def cpu_temperature() -> float | None:
@@ -157,10 +196,17 @@ def network_utilisation(
 def collect(
     previous_cpu: tuple[int, int] | None,
     previous_network: dict[str, tuple[int, int, float]] | None,
+    previous_disk_io: tuple[int, float] | None,
     disk_path: str,
-) -> tuple[dict, tuple[int, int], dict[str, tuple[int, int, float]]]:
+) -> tuple[
+    dict,
+    tuple[int, int],
+    dict[str, tuple[int, int, float]],
+    tuple[int, float] | None,
+]:
     cpu, current_cpu = cpu_percent(previous_cpu)
     network, link_up, current_network = network_utilisation(previous_network)
+    disk_io, current_disk_io = disk_io_percent(previous_disk_io, disk_path)
     try:
         load = round(os.getloadavg()[0], 2)
     except OSError:
@@ -169,7 +215,10 @@ def collect(
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "cpu_percent": cpu,
         "memory_percent": memory_percent(),
+        "swap_percent": swap_percent(),
         "disk_percent": disk_percent(disk_path),
+        "disk_io_percent": disk_io,
+        "uptime_seconds": uptime_seconds(),
         "cpu_temp_c": cpu_temperature(),
         "load_1m": load,
         "eth0_percent": network["eth0"],
@@ -177,7 +226,7 @@ def collect(
         "eth0_link_up": link_up["eth0"],
         "eth1_link_up": link_up["eth1"],
         "extra": {"hostname": socket.gethostname()},
-    }, current_cpu, current_network
+    }, current_cpu, current_network, current_disk_io
 
 
 def append_sample(spool_path: Path, sample: dict, maximum_samples: int) -> None:
@@ -257,6 +306,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop_handler)
     previous_cpu = None
     previous_network = None
+    previous_disk_io = None
     next_sample = time.monotonic()
     # CPU and network utilisation are rates. Wait for the second collection
     # before the first upload so the dashboard never receives a baseline 0/—.
@@ -265,8 +315,11 @@ def main() -> int:
         now = time.monotonic()
         if now >= next_sample:
             try:
-                sample, previous_cpu, previous_network = collect(
-                    previous_cpu, previous_network, config["DISK_PATH"]
+                sample, previous_cpu, previous_network, previous_disk_io = collect(
+                    previous_cpu,
+                    previous_network,
+                    previous_disk_io,
+                    config["DISK_PATH"],
                 )
                 append_sample(Path(config["SPOOL_PATH"]), sample, int(config["MAX_SPOOL_SAMPLES"]))
             except (OSError, ValueError, KeyError) as error:
