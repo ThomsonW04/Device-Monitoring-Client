@@ -7,6 +7,7 @@
 import json
 import logging
 import os
+import pwd
 import signal
 import socket
 import stat
@@ -354,6 +355,44 @@ def largest_files(path: str, limit: int = 30) -> list[tuple[int, str]]:
     return sorted(files, reverse=True)
 
 
+def process_io_output(limit: int = 40) -> str:
+    """Return processes ranked by cumulative kernel-accounted read/write bytes."""
+    processes: list[tuple[int, int, int, str, int, str]] = []
+    for process_path in Path("/proc").iterdir():
+        if not process_path.name.isdigit():
+            continue
+        try:
+            io_values = {
+                key.rstrip(":"): int(value)
+                for key, value in (
+                    line.split(":", 1) for line in (process_path / "io").read_text().splitlines()
+                )
+            }
+            read_bytes = io_values.get("read_bytes", 0)
+            write_bytes = io_values.get("write_bytes", 0)
+            total_bytes = read_bytes + write_bytes
+            user = pwd.getpwuid(process_path.stat().st_uid).pw_name
+            command = (process_path / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", errors="replace"
+            ).strip()
+            if not command:
+                command = (process_path / "comm").read_text(encoding="utf-8").strip()
+        except (KeyError, OSError, ValueError):
+            continue
+        processes.append((total_bytes, read_bytes, write_bytes, user, int(process_path.name), command))
+
+    lines = ["TOTAL BYTES       READ BYTES        WRITE BYTES       USER             PID  COMMAND"]
+    for total_bytes, read_bytes, write_bytes, user, process_id, command in sorted(
+        processes, reverse=True
+    )[:limit]:
+        lines.append(
+            f"{total_bytes:>15,} {read_bytes:>15,} {write_bytes:>18,} "
+            f"{user[:16]:<16} {process_id:>7}  {command}"
+        )
+    lines.append("Values are cumulative process I/O totals at the capture time.")
+    return "\n".join(lines) + "\n"
+
+
 def cleanup_snapshot_logs() -> None:
     """Remove this agent's diagnostic snapshots once they are older than 30 days."""
     cutoff = time.time() - SNAPSHOT_RETENTION_SECONDS
@@ -415,6 +454,8 @@ def write_snapshot(triggered: set[str], sample: dict, disk_path: str) -> None:
             write_section(log_file, "MEMORY SUMMARY", command_output(["free", "-h"]))
             write_section(log_file, "DISK SPACE", command_output(["df", "-h", disk_path]))
             write_section(log_file, "DISK I/O COUNTERS", file_contents(Path("/proc/diskstats")))
+            if "Disk I/O" in triggered:
+                write_section(log_file, "TOP DISK I/O PROCESSES", process_io_output())
             write_section(log_file, "NETWORK COUNTERS", file_contents(Path("/proc/net/dev")))
             write_section(log_file, "ETH0 DETAILS", command_output(["ip", "-s", "link", "show", "eth0"]))
             write_section(log_file, "ETH1 DETAILS", command_output(["ip", "-s", "link", "show", "eth1"]))
