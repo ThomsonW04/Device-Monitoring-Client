@@ -54,17 +54,19 @@ sudo ./install.sh
 sudo systemctl status agv-monitor
 ```
 
-On its first run the installer prompts for `SERVER_URL`, the device's unique
-`DEVICE_TOKEN`, and collection settings before starting the service. The token
-entry is hidden while you type. The resulting root-only configuration remains
-at `/etc/agv-monitor/telemetry.conf`; the installer never overwrites an
-existing configuration. The token must be provisioned for the Pi's current
-source IP address; the server rejects a token used from any other IP.
+On its first run the installer prompts for `SERVER_URL`, device name, device
+IP address, administrator username/password, and collection settings before
+starting the service. It calls the server registration API and saves only the
+returned device token in the root-only `/etc/agv-monitor/telemetry.conf`; it
+never writes the administrator password to disk. The installer never
+overwrites an existing configuration. The IP must be the address the Pi uses
+to reach the server; the server rejects a token used from any other IP.
 
-HTTPS is selected by default. Place the server's public `agv-monitor-ca.crt`
-beside `install.sh`; the installer adds it to the Pi's system trust store using
+HTTPS is selected by default and the installer contains the server's public CA
+certificate. It adds this CA to the Pi's system trust store using
 `update-ca-certificates`. Select `n` only when deliberately connecting to a
-plain-HTTP server: HTTP exposes telemetry and device tokens to the network.
+plain-HTTP server: HTTP exposes telemetry, device tokens, and the one-time
+registration credentials to the network.
 
 ## Useful checks
 

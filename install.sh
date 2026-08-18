@@ -44,15 +44,74 @@ prompt_yes_no() {
 }
 
 install_ca_certificate() {
-    ca_source_path=$1
     ca_destination_path=/usr/local/share/ca-certificates/agv-monitor-ca.crt
-    if [ ! -f "$ca_source_path" ]; then
-        echo "HTTPS was selected, but $ca_source_path is missing." >&2
-        echo 'Copy agv-monitor-ca.crt beside install.sh and run the installer again.' >&2
-        exit 1
-    fi
-    install -m 0644 "$ca_source_path" "$ca_destination_path"
+    base64 -d > "$ca_destination_path" <<'CERTIFICATE'
+LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUZ4ekNDQTYrZ0F3SUJBZ0lVQmlGTDFEZUtVMkFnRW12VlgvVTZzRVRpM1BZd0RRWUpLb1pJaHZjTkFRRUwKQlFBd2N6RWlNQ0FHQTFVRUNnd1pVbTk1WVd3Z1RXRnBiQ0JCUjFZZ1RXOXVhWFJ2Y21sdVp6RW1NQ1FHQTFVRQpDd3dkVUhKcGRtRjBaU0JEWlhKMGFXWnBZMkYwWlNCQmRYUm9iM0pwZEhreEpUQWpCZ05WQkFNTUhGSnZlV0ZzCklFMWhhV3dnUVVkV0lFMXZibWwwYjNKcGJtY2dRMEV3SGhjTk1qWXdPREU0TVRFeU9EVXpXaGNOTXpZd09ERTEKTVRFeU9EVXpXakJ6TVNJd0lBWURWUVFLREJsU2IzbGhiQ0JOWVdsc0lFRkhWaUJOYjI1cGRHOXlhVzVuTVNZdwpKQVlEVlFRTERCMVFjbWwyWVhSbElFTmxjblJwWm1sallYUmxJRUYxZEdodmNtbDBlVEVsTUNNR0ExVUVBd3djClVtOTVZV3dnVFdGcGJDQkJSMVlnVFc5dWFYUnZjbWx1WnlCRFFUQ0NBaUl3RFFZSktvWklodmNOQVFFQkJRQUQKZ2dJUEFEQ0NBZ29DZ2dJQkFNbHVrb09reFhpVnQ4VXhOL0NjQXNkS1VqYzR6SXFrOFVQQitpSzJOK2F4akx0VQpTS0JvS3VvM09JSWJXWFpMOTByWnNkUnI3YjROb1VTaWUvTUczTDRIZHBPd1FBTUswWW1OYVN3dmQrSHRHZXkzCk51SUN4NDlJMkd1T1hoUXIvREw4cHE3VVg1Y3Z1REFrWlp1bXpvM1BEL1NwL1NqcFAyQlF1c29tN00zV3A3UXgKaFZwNThrUWVTZGc4NVI5d0Q1bkFSbndxM002b1BjYU9GQnEvRWZrWDJqZ3NPS0QyU3k4b1pQSm0rN2tpNzVlawp0Y1RtZDhTdW9EOGxaT3Jhck5Oem8wQi9ybytNT2RteFJxdUVHdW1IMGFmYUc2cmNIQTQ2TlNnZ1JqNzladkEvCm5GMmYvSElTaUp5Um5rTnpicmVoR2FQaVRYRER6WTdqeUExN2FpbjdxbWNLaUhmODFTbW1tVHYvK25MWUxjQkkKRFIrdHVYeFphakZybDllbVgyT1Z2dk1PeVk3MWo3RHdSWitUQTlSQXJJNUZPR3R1M1dBQVA2NHBVbnUxbjZFcApSU1ZEOTV1eG9yT0ZSNjhvTzFSQnJxUC9GSkFiQ0E2TEw3YUs1MkJTUWg1Qkd1d0hja1JJbXp1enNNREI5cnEyCnRDLzl4VlFCVFpDZG1yWVZUWGdsYmZaa2lmcGxhME4zSDJyeFptV1BPUjZvUm54Um1JVVdzcUdhajZoZXVCc2kKdlJLQjMwcUVaUkRnNXMwRkszMEdDc2ZkclNsSEdVazBNcWxWdGtkMXR0N1F6QkR5SUQ0WDEvNW8wckF0RWRENwpoMDJBbG1qQy9Makx6QlF1QjhnYkJieHoxVU1VOHo5TEpqWWc2ZmlVTDFleGtPRml2ZWRoaTl5R2J1RmJBZ01CCkFBR2pVekJSTUIwR0ExVWREZ1FXQkJSNUIwU2pVdE5pVFMrZy9WenUyS2V6SDNFa2R6QWZCZ05WSFNNRUdEQVcKZ0JSNUIwU2pVdE5pVFMrZy9WenUyS2V6SDNFa2R6QVBCZ05WSFJNQkFmOEVCVEFEQVFIL01BMEdDU3FHU0liMwpEUUVCQ3dVQUE0SUNBUUMveWhaSTdIS2EwT3lxYWRGNk1HazliOG84Z1dCcGkwT1RlTE9ibitxdVBwdFdWNzNUCjJTV0x0QUlsT1pkQUN2UEd3Z1orTE5JSFNNTUNKY0ptZjk0dGxhcmk1YnJNWVhJcWNxUkhEQURabk5TQlNxMVkKNzJ6bFY5ZGpHci9Ec1JrbGE2eEZVcXVyM3FRMjVRK2lqVTh6eHcwd2tDbUgzRmo5Z3VTTVNtRlBieGgxUTJFdQpJWStRQ09zUEoydkRxckttQ1lNS0VJdnhTQkVvVEgvSmo1ZkozeDdDU0dCMFluVnZSTDFMQVU4M1Z2UzB6T3l2CmR0TXJEY3NnekRpdWQ5UWwrbDhlMWZUektxNWQyZFVMMXIvREF4SU43Yll5TklXT3JkZk5HTVRRSlMxS0dFTkoKNjh5THBEYndha1ZyTXRUZ2o3M1NZd1pJVnJkOVJtWVBLbXVqQU10U2J2eXAzOHdFdGlGUDRqRmVxTjBQRy95TApockFBcjNYK0hrRXdNdzArUE9iMElZQUl0Zk44VklOd3BKNG9ZT2JSdDBIeXZRTnFQZlVkamJPWkN2dWtERHd4CkI2UDBRdUpzeWw5dUVqRTBmcnV1Z2xJQnpGUTRqWTNHcVJLTjR5S1ovNDhSYTlkeGx3cnJqRDlXYTdCOFg4STIKUzNQNnJ5K1VUUTlUUjErWWNpUzdLZmhNZ3ZIR29SNXpRUnpYTk1LN3hpU1dZV0UrdXBvT2U4YzJobUkwZzhoUQpyK0dta2F0SFhQMFlYVm55MFVpNnJhNmlXWFI2TEFYRSttVUFiMTBkem1vT0hTaHU1aGQyME5SUDRDeEJzT0xNCkE1T3hIY3d5MTh3ZnNlZUhVdjZOU2VPK0o2azNMWm5EN0liUWE3dGVRM1U2Rk5Pejg1S1JoaXhXMVE9PQotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==
+CERTIFICATE
+    chmod 0644 "$ca_destination_path"
     update-ca-certificates
+}
+
+# The current public CA. The earlier function definition is intentionally
+# overridden here so an already-downloaded installer cannot trust an obsolete
+# CA after a certificate rotation.
+install_ca_certificate() {
+    ca_destination_path=/usr/local/share/ca-certificates/agv-monitor-ca.crt
+    base64 -d > "$ca_destination_path" <<'CERTIFICATE'
+LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUZ4ekNDQTYrZ0F3SUJBZ0lVV3NTcE82V0J0UXY1ZXlmMERoSTJ6RWMwci9rd0RRWUpLb1pJaHZjTkFRRUwKQlFBd2N6RWlNQ0FHQTFVRUNnd1pVbTk1WVd3Z1RXRnBiQ0JCUjFZZ1RXOXVhWFJ2Y21sdVp6RW1NQ1FHQTFVRQpDd3dkVUhKcGRtRjBaU0JEWlhKMGFXWnBZMkYwWlNCQmRYUm9iM0pwZEhreEpUQWpCZ05WQkFNTUhGSnZlV0ZzCklFMWhhV3dnUVVkV0lFMXZibWwwYjNKcGJtY2dRMEV3SGhjTk1qWXdPREU0TVRFek9EQXhXaGNOTXpjd09ERTQKTVRFek9EQXhXakJ6TVNJd0lBWURWUVFLREJsU2IzbGhiQ0JOWVdsc0lFRkhWaUJOYjI1cGRHOXlhVzVuTVNZdwpKQVlEVlFRTERCMVFjbWwyWVhSbElFTmxjblJwWm1sallYUmxJRUYxZEdodmNtbDBlVEVsTUNNR0ExVUVBd3djClVtOTVZV3dnVFdGcGJDQkJSMVlnVFc5dWFYUnZjbWx1WnlCRFFUQ0NBaUl3RFFZSktvWklodmNOQVFFQkJRQUQKZ2dJUEFEQ0NBZ29DZ2dJQkFMV3RpTURaTjBySHdDZGUyTExIMzc3QXBIZkU2Z054Y3VwTHlKOEJjRFZteTFlLwpFY3BzL3pjdERuVFdGT3lnNnNUNE9ObHpYc0wwZjVON3Z5Z3lPZ2JtMEhjWEhNeC8wQlQyY3I4Vk1Xdkx1ckljCjA5Q3o2anlHTmh5K1RNK0JMdkZwWFZYb0xHQndRL3N4d2lFM2RCYUE4UFBYdm03TUVac0FuRk9zYmtka2FPWDEKREN5aWMvTEkxakY3QmdFSXhXL2xCeWVCOGtHVGhrWldzVW5lWE5KNnNxeWZuSnJtbU9lVVlNdURKYUxpM01qSwpHWkFPNDhwYVd3aTVuVjFVamEyU3JOQWl6Wkg1L1FlN0Q4Nk5tWE5uNWxQKzFLa3R4MGoxVGQxMDViZS9KL1pBCm4xRlQvMWVxMVI4emtqWVJkMWM1RE81VktySHBvMGFpNVFkc00wYkVIZlBOZi9MaU1KNzM3R0drOUJOekh3ZGMKZmJlZ2NHVzRmNU4xZVBRS012UnoxZ2RPZUhtdmgyR2p3Y0tQS1lPS294U1R5Sy9MZTFEVzIxaUJ5TEU1SFVwego5YklnOXhEanRvcmU0K0xFYysrWWZGMmpTZ2pvM0tFOFdmMFVGRkZsY29ZNWtWMXBzaEJGMlBEV2VMdFBZYWRxCjcyMnJkYStFbWNGY1lhWkluQW8wL0I0NDFLR0hmTWZVQndkN2JuRzdRTG8wV1JBRHVuQ1pWYnRaNTE1NkIyNUEKUmtyTmdJQVB4UTk5YzJRTzlKOXIyd1pGYVdweVhEdjZiZEppSWlqK3BpaDVNak9peWc3SWZ1VnVMWnNuSUo4SgpGaW9pVEl2MVBDbmtqaktWWUZ2RjM0ZWNnT2RsWnRUeDdqK3pJM05zU1o0cDNqUjR2NHh2RllvWHd1a0pBZ01CCkFBR2pVekJSTUIwR0ExVWREZ1FXQkJUSm5tKzdyb1NEd09rYTBlRXdTaFlRTU02Q056QWZCZ05WSFNNRUdEQVcKZ0JUSm5tKzdyb1NEd09rYTBlRXdTaFlRTU02Q056QVBCZ05WSFJNQkFmOEVCVEFEQVFIL01BMEdDU3FHU0liMwpEUUVCQ3dVQUE0SUNBUUF2L0RsckpwRDRHdDFXaXpKaCt4QVgyUThaS21qNGhzRE1WTFJnWTA1YWRnYmk1RFlWCk8zaXhLL2E5L0preVgvUkJiMk1xZ0hhTnY2UElKWVgvajlvWlZDQ1FYTS9BbVdiSmhZWkRudk43cVRSMWpPbjUKdkMzZlpMRWVlaDVMc0xqa25DanNTV3BvaTg4bEJ4VmRNeWs2Z1NkSWN1MVJUTkppc0VyVWdGL09sbkNEWVVrSwpHaXlFVkxDTzhMYkU1b3hURHhPMGMwcU40OGFlQjVwZkpLYjRtcUpTNHBYdlcvTDh1bVpvM2ZZM3B4MHF4WnQwCi9qZlp5Q052dUl4eHBlWmhZR1c0SGtzREQ0VEZJU2xzUXdTWWdMNjdoZFNFYkFNWkxTKzBNV0Z3Y0RSRDJEZXEKS1RXSEhRQkhUR2EvU1JOblM2Y01kLzlpdHV5enhvV2NadGhsd1FUSi9acWxld21CUnFkRTRFYXAxcGxOOUhWUwp0ei9yWHRHOXRoWHh6UkppYkNpU3Fya3c0SVZJcFp2L1RGZ3lVTG9kelAwcmRmSjVBcittM295aEl1U0VZUWtaCnJ3OUI1bi9FMlR5ZWpQNUFtcW5rOWJidy9LemxTU1MxTHd5cWNjNndOZUgxMTQxVUlWaWtnVWtXTlpJQlBYdVIKVjlhdzR5L2FHdCtHcW1odXlOV200ZHZ0dFhZaXBXTEkwblBQNThNWEFXSWx0aFlKTjdaVDluQ0llVGZnVDVxSQpoYkRRSHJRTHVtSWZGSVFiZjYvQXFibFBVMTBQL2RYenpTQWxCVXV4YkJVekJlZEkzZU5DSk90MmV3VXFYN3FZCndPN2U0T2hnbzFyQWk5ZEJ5UjBpQkJwK010Wk9rZG4wdEFTUDFCT0RvN3RzdmM5MlUwdUM4VjB0a3c9PQotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==
+CERTIFICATE
+    chmod 0644 "$ca_destination_path"
+    update-ca-certificates
+}
+
+registration_url() {
+    python3 -c '
+import sys
+from urllib.parse import urlsplit, urlunsplit
+
+telemetry_url = urlsplit(sys.argv[1])
+if not telemetry_url.scheme or not telemetry_url.netloc:
+    raise SystemExit("Server telemetry URL must be a full http:// or https:// URL")
+print(urlunsplit((telemetry_url.scheme, telemetry_url.netloc, "/api/v1/devices/register", "", "")))
+' "$1"
+}
+
+register_device() {
+    telemetry_url=$1
+    admin_username=$2
+    admin_password=$3
+    device_name=$4
+    device_ip=$5
+    endpoint=$(registration_url "$telemetry_url")
+    payload=$(AGV_REGISTER_USERNAME="$admin_username" \
+        AGV_REGISTER_PASSWORD="$admin_password" \
+        AGV_REGISTER_NAME="$device_name" \
+        AGV_REGISTER_IP="$device_ip" \
+        python3 -c '
+import json
+import os
+
+print(json.dumps({
+    "username": os.environ["AGV_REGISTER_USERNAME"],
+    "password": os.environ["AGV_REGISTER_PASSWORD"],
+    "name": os.environ["AGV_REGISTER_NAME"],
+    "ip_address": os.environ["AGV_REGISTER_IP"],
+}))
+')
+    response=$(printf '%s' "$payload" | curl --fail --silent --show-error \
+        -H 'Content-Type: application/json' \
+        --data-binary @- \
+        "$endpoint")
+    printf '%s' "$response" | python3 -c '
+import json
+import sys
+
+response = json.load(sys.stdin)
+token = response.get("device_token")
+if not isinstance(token, str) or not token:
+    raise SystemExit("Registration response did not contain a device token")
+print(token)
+'
 }
 
 install -d -m 0750 /etc/agv-monitor /var/lib/agv-monitor /usr/local/lib/agv-monitor
@@ -60,18 +119,31 @@ install -m 0755 telemetry_agent.py /usr/local/lib/agv-monitor/telemetry_agent.py
 install -m 0644 agv-monitor.service /etc/systemd/system/agv-monitor.service
 if [ ! -f /etc/agv-monitor/telemetry.conf ]; then
     echo 'Configure this device (press Enter to accept a displayed default).'
-    if prompt_yes_no 'Use HTTPS with the AGV Monitoring CA (recommended)' 'Y'; then
-        install_ca_certificate ./agv-monitor-ca.crt
-        server_url=$(prompt_value 'Server telemetry URL' 'https://monitor.example.com:8085/api/v1/telemetry')
-    else
-        echo 'Warning: HTTP leaves device tokens and telemetry visible to the network.' >&2
-        server_url=$(prompt_value 'Server telemetry URL' 'http://monitor.example.com:8085/api/v1/telemetry')
-    fi
-    device_token=$(prompt_secret 'Device token')
-    if [ -z "$device_token" ]; then
-        echo 'A device token is required; configuration was not created.' >&2
+    if ! command -v curl >/dev/null 2>&1; then
+        echo 'curl is required to register this device.' >&2
         exit 1
     fi
+    if prompt_yes_no 'Use HTTPS with the AGV Monitoring CA (recommended)' 'Y'; then
+        install_ca_certificate ./agv-monitor-ca.crt
+        server_url=$(prompt_value 'Server telemetry URL' 'https://10.54.168.13:8085/api/v1/telemetry')
+    else
+        echo 'Warning: HTTP leaves device tokens and telemetry visible to the network.' >&2
+        server_url=$(prompt_value 'Server telemetry URL' 'http://10.54.168.13:8085/api/v1/telemetry')
+    fi
+    device_name=$(prompt_value 'Device name' "$(hostname)")
+    device_ip=$(prompt_value 'Device IP address' '')
+    if [ -z "$device_name" ] || [ -z "$device_ip" ]; then
+        echo 'A device name and IP address are required; configuration was not created.' >&2
+        exit 1
+    fi
+    admin_username=$(prompt_value 'Monitoring administrator username' 'admin')
+    admin_password=$(prompt_secret 'Monitoring administrator password')
+    if [ -z "$admin_username" ] || [ -z "$admin_password" ]; then
+        echo 'Administrator credentials are required; configuration was not created.' >&2
+        exit 1
+    fi
+    echo 'Registering device with the monitoring server...'
+    device_token=$(register_device "$server_url" "$admin_username" "$admin_password" "$device_name" "$device_ip")
     sample_interval=$(prompt_value 'Sample interval in seconds' '5')
     upload_interval=$(prompt_value 'Upload interval in seconds' '300')
     disk_path=$(prompt_value 'Filesystem path to monitor' '/')
