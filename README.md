@@ -13,9 +13,12 @@ enough counter history to report meaningful percentages immediately.
 When a metric first crosses its threshold, the agent writes a timestamped
 diagnostic file to `/var/log/AGV-Monitor-<UTC timestamp>.log`. It captures the
 triggering telemetry, top CPU and memory processes (including user, PID, and
-command), memory, disk I/O, network counters, socket summary, and Raspberry Pi
-thermal-throttling status when available. Storage events also include the 30
-largest regular files on the monitored filesystem.
+process name but never command-line arguments), memory, disk I/O, network
+counters, socket summary, and Raspberry Pi thermal-throttling status when
+available. Storage events include the sizes of the 30 largest regular files,
+but omit their paths. Before writing or uploading a snapshot, the agent also
+redacts common password, token, API-key, bearer-authorization, and URI-password
+formats.
 
 Thresholds are CPU/RAM/Disk I/O/Swap/eth0/eth1 at 95%, Storage at 90%, and CPU
 temperature at 80°C. A snapshot is created every time a metric crosses from
@@ -41,9 +44,9 @@ SNAPSHOT_TEMPERATURE_THRESHOLD_C=80
 SNAPSHOT_LOG_RETENTION_DAYS=30
 ```
 
-When a snapshot is created, the agent attaches a bounded copy of the log to
-the same telemetry sample. The server stores it with the matching alert, where
-it can be opened from the Alerts page.
+When a snapshot is created, the agent attaches a bounded 64 KB copy of the log
+to the same telemetry sample. The server stores it with the matching alert,
+where it can be opened from the Alerts page.
 
 ## Install on each device
 
@@ -60,13 +63,34 @@ starting the service. It calls the server registration API and saves only the
 returned device token in the root-only `/etc/agv-monitor/telemetry.conf`; it
 never writes the administrator password to disk. The installer never
 overwrites an existing configuration. The IP must be the address the Pi uses
-to reach the server; the server rejects a token used from any other IP.
+to reach the server and must match the Pi's direct connection while it
+registers; the server rejects a token used from any other IP. The server ignores
+`X-Forwarded-For` supplied by a device.
 
 HTTPS is selected by default and the installer contains the server's public CA
 certificate. It adds this CA to the Pi's system trust store using
 `update-ca-certificates`. Select `n` only when deliberately connecting to a
 plain-HTTP server: HTTP exposes telemetry, device tokens, and the one-time
 registration credentials to the network.
+
+Rerun the current `install.sh` on every existing HTTPS device after a CA
+rotation. It preserves the device configuration, replaces the installed AGV
+Monitoring CA, and restarts the service.
+
+## Uninstall
+
+To remove the agent and all AGV Monitoring artifacts created by the installer:
+
+```sh
+sudo ./uninstall.sh
+```
+
+It stops and disables the service, removes its unit, configuration, queued
+telemetry, installed agent, AGV CA certificate, and `/var/log/AGV-Monitor-*.log`
+diagnostic snapshots. This permanently deletes the configuration and any
+unsent telemetry. Shared system-journal entries are intentionally left to the
+host's normal journal-retention policy, because they cannot be safely purged
+per service.
 
 ## Useful checks
 

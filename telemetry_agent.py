@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import pwd
+import re
 import signal
 import socket
 import stat
@@ -60,7 +61,23 @@ SNAPSHOT_METRICS = {
     "eth1": ("eth1_percent", "SNAPSHOT_ETH1_THRESHOLD_PERCENT"),
     "Temperature": ("cpu_temp_c", "SNAPSHOT_TEMPERATURE_THRESHOLD_C"),
 }
-MAX_SNAPSHOT_TRANSPORT_BYTES = 256_000
+MAX_SNAPSHOT_TRANSPORT_BYTES = 64_000
+SNAPSHOT_TRUNCATION_NOTICE = (
+    "\n… snapshot upload truncated; see the local log for the complete content.\n"
+)
+BEARER_CREDENTIAL_PATTERN = re.compile(
+    r"(?i)(\bauthorization\s*:\s*bearer\s+)[^\s,;]+"
+)
+LABELED_SECRET_PATTERN = re.compile(
+    r"""(?ix)
+    (?P<label>
+        \b(?:api[_-]?key|access[_-]?token|authorization|password|passwd|secret|token)\b
+        [\"']?\s*[:=]\s*(?:bearer\s+)?[\"']?
+    )
+    (?P<secret>[^\s,;'\"}\]]+)
+    """
+)
+URI_PASSWORD_PATTERN = re.compile(r"(?i)(://[^/\s:@]+:)[^@/\s]+(@)")
 
 
 def configure_logging() -> logging.Logger:
@@ -73,6 +90,27 @@ def configure_logging() -> logging.Logger:
 
 
 LOG = configure_logging()
+
+
+def redact_sensitive_values(content: str) -> str:
+    """Remove common secret values before a diagnostic log is written or uploaded."""
+    content = LABELED_SECRET_PATTERN.sub(r"\g<label>[REDACTED]", content)
+    content = BEARER_CREDENTIAL_PATTERN.sub(r"\1[REDACTED]", content)
+    return URI_PASSWORD_PATTERN.sub(r"\1[REDACTED]\2", content)
+
+
+def bounded_snapshot_content(content: str) -> str:
+    """Return a UTF-8-safe diagnostic attachment within the server's byte limit."""
+    encoded_content = content.encode("utf-8")
+    if len(encoded_content) <= MAX_SNAPSHOT_TRANSPORT_BYTES:
+        return content
+    content_limit = MAX_SNAPSHOT_TRANSPORT_BYTES - len(
+        SNAPSHOT_TRUNCATION_NOTICE.encode("utf-8")
+    )
+    return (
+        encoded_content[:content_limit].decode("utf-8", errors="ignore")
+        + SNAPSHOT_TRUNCATION_NOTICE
+    )
 
 
 def load_config() -> dict[str, str]:
@@ -431,22 +469,22 @@ def process_io_output(limit: int = 40) -> str:
             write_bytes = io_values.get("write_bytes", 0)
             total_bytes = read_bytes + write_bytes
             user = pwd.getpwuid(process_path.stat().st_uid).pw_name
-            command = (process_path / "cmdline").read_bytes().replace(b"\0", b" ").decode(
-                "utf-8", errors="replace"
-            ).strip()
-            if not command:
-                command = (process_path / "comm").read_text(encoding="utf-8").strip()
+            process_name = (process_path / "comm").read_text(encoding="utf-8").strip()
+            if not process_name:
+                continue
         except (KeyError, OSError, ValueError):
             continue
-        processes.append((total_bytes, read_bytes, write_bytes, user, int(process_path.name), command))
+        processes.append(
+            (total_bytes, read_bytes, write_bytes, user, int(process_path.name), process_name)
+        )
 
-    lines = ["TOTAL BYTES       READ BYTES        WRITE BYTES       USER             PID  COMMAND"]
-    for total_bytes, read_bytes, write_bytes, user, process_id, command in sorted(
+    lines = ["TOTAL BYTES       READ BYTES        WRITE BYTES       USER             PID  PROCESS"]
+    for total_bytes, read_bytes, write_bytes, user, process_id, process_name in sorted(
         processes, reverse=True
     )[:limit]:
         lines.append(
             f"{total_bytes:>15,} {read_bytes:>15,} {write_bytes:>18,} "
-            f"{user[:16]:<16} {process_id:>7}  {command}"
+            f"{user[:16]:<16} {process_id:>7}  {process_name}"
         )
     lines.append("Values are cumulative process I/O totals at the capture time.")
     return "\n".join(lines) + "\n"
@@ -465,7 +503,7 @@ def cleanup_snapshot_logs(retention_days: int) -> None:
 
 def write_section(log_file, title: str, content: str) -> None:
     log_file.write(f"\n{'=' * 20} {title} {'=' * 20}\n")
-    log_file.write(content.rstrip() + "\n")
+    log_file.write(redact_sensitive_values(content).rstrip() + "\n")
 
 
 def write_snapshot(
@@ -510,10 +548,10 @@ def write_snapshot(
                 ),
             )
             write_section(log_file, "TOP CPU PROCESSES", command_output([
-                "ps", "-eo", "user:16,pid,ppid,ni,stat,pcpu,pmem,rss,vsz,etime,comm,args", "--sort=-pcpu"
+                "ps", "-eo", "user:16,pid,ppid,ni,stat,pcpu,pmem,rss,vsz,etime,comm", "--sort=-pcpu"
             ], line_limit=41))
             write_section(log_file, "TOP MEMORY PROCESSES", command_output([
-                "ps", "-eo", "user:16,pid,ppid,ni,stat,pcpu,pmem,rss,vsz,etime,comm,args", "--sort=-pmem"
+                "ps", "-eo", "user:16,pid,ppid,ni,stat,pcpu,pmem,rss,vsz,etime,comm", "--sort=-pmem"
             ], line_limit=41))
             write_section(log_file, "MEMORY", file_contents(Path("/proc/meminfo")))
             write_section(log_file, "MEMORY SUMMARY", command_output(["free", "-h"]))
@@ -531,15 +569,15 @@ def write_snapshot(
             if "Storage" in triggered:
                 largest = largest_files(disk_path)
                 file_list = "\n".join(
-                    f"{size:>14,} bytes  {file_path}" for size, file_path in largest
+                    f"{size:>14,} bytes" for size, _file_path in largest
                 ) or "No regular files found."
+                file_list = (
+                    "Individual file paths are omitted to avoid recording potentially "
+                    "sensitive names.\n" + file_list
+                )
                 write_section(log_file, "LARGEST FILES", file_list)
         content = log_path.read_text(encoding="utf-8", errors="replace")
-        encoded_content = content.encode("utf-8")
-        if len(encoded_content) > MAX_SNAPSHOT_TRANSPORT_BYTES:
-            content = encoded_content[:MAX_SNAPSHOT_TRANSPORT_BYTES].decode(
-                "utf-8", errors="ignore"
-            ) + "\n… snapshot upload truncated; see the local log for the complete content.\n"
+        content = bounded_snapshot_content(content)
         LOG.warning("Wrote high-utilisation diagnostic snapshot to %s", log_path)
         return {
             "captured_at": timestamp.isoformat(),
