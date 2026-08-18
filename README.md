@@ -18,9 +18,32 @@ thermal-throttling status when available. Storage events also include the 30
 largest regular files on the monitored filesystem.
 
 Thresholds are CPU/RAM/Disk I/O/Swap/eth0/eth1 at 95%, Storage at 90%, and CPU
-temperature at 80°C. A sustained breach creates one snapshot on entry rather
-than every sampling interval. Snapshot logs are removed automatically after 30
-days.
+temperature at 80°C. A snapshot is created every time a metric crosses from
+below its threshold to at or above it. It does not create another snapshot at
+each sampling interval while that same breach remains active. Snapshot logs
+are removed automatically after 30 days.
+
+The settings are global: an authenticated agent retrieves them from the server
+at startup and again at 12:00 noon local time each day. Changes made in the
+server Settings page therefore reach every device within 24 hours. The local
+values in `/etc/agv-monitor/telemetry.conf` are safe fallbacks while the
+server is unavailable:
+
+```ini
+SNAPSHOT_CPU_THRESHOLD_PERCENT=95
+SNAPSHOT_MEMORY_THRESHOLD_PERCENT=95
+SNAPSHOT_STORAGE_THRESHOLD_PERCENT=90
+SNAPSHOT_DISK_IO_THRESHOLD_PERCENT=95
+SNAPSHOT_SWAP_THRESHOLD_PERCENT=95
+SNAPSHOT_ETH0_THRESHOLD_PERCENT=95
+SNAPSHOT_ETH1_THRESHOLD_PERCENT=95
+SNAPSHOT_TEMPERATURE_THRESHOLD_C=80
+SNAPSHOT_LOG_RETENTION_DAYS=30
+```
+
+When a snapshot is created, the agent attaches a bounded copy of the log to
+the same telemetry sample. The server stores it with the matching alert, where
+it can be opened from the Alerts page.
 
 ## Install on each device
 
@@ -37,6 +60,11 @@ entry is hidden while you type. The resulting root-only configuration remains
 at `/etc/agv-monitor/telemetry.conf`; the installer never overwrites an
 existing configuration. The token must be provisioned for the Pi's current
 source IP address; the server rejects a token used from any other IP.
+
+HTTPS is selected by default. Place the server's public `agv-monitor-ca.crt`
+beside `install.sh`; the installer adds it to the Pi's system trust store using
+`update-ca-certificates`. Select `n` only when deliberately connecting to a
+plain-HTTP server: HTTP exposes telemetry and device tokens to the network.
 
 ## Useful checks
 

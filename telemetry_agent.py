@@ -16,18 +16,18 @@ import sys
 import time
 from heapq import heappush, heapreplace
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from logging.handlers import SysLogHandler
 from pathlib import Path
-from threading import Lock, Thread
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 
 # All device-specific settings belong in the EnvironmentFile specified here.
 CONFIG_PATH = Path(os.environ.get("AGV_MONITOR_CONFIG", "/etc/agv-monitor/telemetry.conf"))
 DEFAULTS = {
-    "SERVER_URL": "http://monitor.example.com:8080/api/v1/telemetry",
+    "SERVER_URL": "http://monitor.example.com:8085/api/v1/telemetry",
     "DEVICE_TOKEN": "",
     "SAMPLE_INTERVAL_SECONDS": "5",
     "UPLOAD_INTERVAL_SECONDS": "300",
@@ -35,25 +35,32 @@ DEFAULTS = {
     "SPOOL_PATH": "/var/lib/agv-monitor/telemetry-spool.jsonl",
     "MAX_SPOOL_SAMPLES": "120960",  # seven days at the five-second default
     "HTTP_TIMEOUT_SECONDS": "20",
+    "SNAPSHOT_CPU_THRESHOLD_PERCENT": "95",
+    "SNAPSHOT_MEMORY_THRESHOLD_PERCENT": "95",
+    "SNAPSHOT_STORAGE_THRESHOLD_PERCENT": "90",
+    "SNAPSHOT_DISK_IO_THRESHOLD_PERCENT": "95",
+    "SNAPSHOT_SWAP_THRESHOLD_PERCENT": "95",
+    "SNAPSHOT_ETH0_THRESHOLD_PERCENT": "95",
+    "SNAPSHOT_ETH1_THRESHOLD_PERCENT": "95",
+    "SNAPSHOT_TEMPERATURE_THRESHOLD_C": "80",
+    "SNAPSHOT_LOG_RETENTION_DAYS": "30",
 }
 MAX_BATCH_SIZE = 90  # The server API's explicit maximum.
 NETWORK_INTERFACES = ("eth0", "eth1")
 STOP_REQUESTED = False
 SNAPSHOT_LOG_DIRECTORY = Path("/var/log")
 SNAPSHOT_LOG_PREFIX = "AGV-Monitor-"
-SNAPSHOT_RETENTION_SECONDS = 30 * 24 * 60 * 60
-SNAPSHOT_CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
-SNAPSHOT_LOCK = Lock()
 SNAPSHOT_METRICS = {
-    "CPU": ("cpu_percent", 95.0),
-    "Memory": ("memory_percent", 95.0),
-    "Storage": ("disk_percent", 90.0),
-    "Disk I/O": ("disk_io_percent", 95.0),
-    "Swap": ("swap_percent", 95.0),
-    "eth0": ("eth0_percent", 95.0),
-    "eth1": ("eth1_percent", 95.0),
-    "Temperature": ("cpu_temp_c", 80.0),
+    "CPU": ("cpu_percent", "SNAPSHOT_CPU_THRESHOLD_PERCENT"),
+    "RAM": ("memory_percent", "SNAPSHOT_MEMORY_THRESHOLD_PERCENT"),
+    "Storage": ("disk_percent", "SNAPSHOT_STORAGE_THRESHOLD_PERCENT"),
+    "Disk I/O": ("disk_io_percent", "SNAPSHOT_DISK_IO_THRESHOLD_PERCENT"),
+    "Swap": ("swap_percent", "SNAPSHOT_SWAP_THRESHOLD_PERCENT"),
+    "eth0": ("eth0_percent", "SNAPSHOT_ETH0_THRESHOLD_PERCENT"),
+    "eth1": ("eth1_percent", "SNAPSHOT_ETH1_THRESHOLD_PERCENT"),
+    "Temperature": ("cpu_temp_c", "SNAPSHOT_TEMPERATURE_THRESHOLD_C"),
 }
+MAX_SNAPSHOT_TRANSPORT_BYTES = 256_000
 
 
 def configure_logging() -> logging.Logger:
@@ -86,6 +93,11 @@ def load_config() -> dict[str, str]:
             raise ValueError(f"{key} must be greater than zero")
     if int(config["MAX_SPOOL_SAMPLES"]) <= 0:
         raise ValueError("MAX_SPOOL_SAMPLES must be greater than zero")
+    if int(config["SNAPSHOT_LOG_RETENTION_DAYS"]) <= 0:
+        raise ValueError("SNAPSHOT_LOG_RETENTION_DAYS must be greater than zero")
+    for _label, (_metric, threshold_key) in SNAPSHOT_METRICS.items():
+        if float(config[threshold_key]) < 0:
+            raise ValueError(f"{threshold_key} must be zero or greater")
     return config
 
 
@@ -287,12 +299,59 @@ def remove_sent_samples(spool_path: Path, count: int) -> None:
     rewrite_spool(spool_path, pending_samples(spool_path)[count:])
 
 
-def high_utilisation_metrics(sample: dict) -> set[str]:
+def snapshot_thresholds(config: dict[str, str]) -> dict[str, float]:
+    """Read per-device diagnostic thresholds from the root-only configuration."""
+    return {
+        label: float(config[threshold_key])
+        for label, (_metric, threshold_key) in SNAPSHOT_METRICS.items()
+    }
+
+
+def settings_url(server_url: str) -> str:
+    """Build the authenticated client-settings endpoint from the telemetry URL."""
+    parsed = urlsplit(server_url)
+    return urlunsplit((parsed.scheme, parsed.netloc, "/api/v1/device-settings", "", ""))
+
+
+def synchronise_snapshot_settings(config: dict[str, str]) -> None:
+    """Fetch the globally managed snapshot settings without overwriting local config files."""
+    request = Request(
+        settings_url(config["SERVER_URL"]),
+        headers={"Authorization": "Bearer " + config["DEVICE_TOKEN"]},
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=float(config["HTTP_TIMEOUT_SECONDS"])) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, OSError, json.JSONDecodeError) as error:
+        LOG.warning("Unable to synchronise global snapshot settings: %s", error)
+        return
+
+    settings = payload.get("snapshot_settings")
+    if not isinstance(settings, dict):
+        LOG.warning("Server returned invalid global snapshot settings")
+        return
+    for key in DEFAULTS:
+        if key.startswith("SNAPSHOT_") and key in settings:
+            config[key] = str(settings[key])
+    LOG.info("Synchronised global snapshot settings from the server")
+
+
+def seconds_until_next_midday() -> float:
+    """Return the interval until the next local 12:00 midday maintenance run."""
+    now = datetime.now().astimezone()
+    midday = now.replace(hour=12, minute=0, second=0, microsecond=0)
+    if midday <= now:
+        midday += timedelta(days=1)
+    return (midday - now).total_seconds()
+
+
+def high_utilisation_metrics(sample: dict, thresholds: dict[str, float]) -> set[str]:
     """Return monitored metrics at or above their diagnostic snapshot threshold."""
     return {
         label
-        for label, (key, threshold) in SNAPSHOT_METRICS.items()
-        if sample.get(key) is not None and float(sample[key]) >= threshold
+        for label, (key, _threshold_key) in SNAPSHOT_METRICS.items()
+        if sample.get(key) is not None and float(sample[key]) >= thresholds[label]
     }
 
 
@@ -393,9 +452,9 @@ def process_io_output(limit: int = 40) -> str:
     return "\n".join(lines) + "\n"
 
 
-def cleanup_snapshot_logs() -> None:
+def cleanup_snapshot_logs(retention_days: int) -> None:
     """Remove this agent's diagnostic snapshots once they are older than 30 days."""
-    cutoff = time.time() - SNAPSHOT_RETENTION_SECONDS
+    cutoff = time.time() - retention_days * 24 * 60 * 60
     for log_path in SNAPSHOT_LOG_DIRECTORY.glob(f"{SNAPSHOT_LOG_PREFIX}*.log"):
         try:
             if log_path.stat().st_mtime < cutoff:
@@ -409,14 +468,20 @@ def write_section(log_file, title: str, content: str) -> None:
     log_file.write(content.rstrip() + "\n")
 
 
-def write_snapshot(triggered: set[str], sample: dict, disk_path: str) -> None:
-    """Write an htop-style diagnostic snapshot after a high-utilisation crossing."""
+def write_snapshot(
+    triggered: set[str],
+    sample: dict,
+    disk_path: str,
+    thresholds: dict[str, float],
+    retention_days: int,
+) -> dict | None:
+    """Write a diagnostic snapshot and return the bounded content for telemetry upload."""
     timestamp = datetime.now(timezone.utc)
     log_path = SNAPSHOT_LOG_DIRECTORY / (
         f"{SNAPSHOT_LOG_PREFIX}{timestamp.strftime('%Y%m%dT%H%M%S.%fZ')}.log"
     )
     try:
-        cleanup_snapshot_logs()
+        cleanup_snapshot_logs(retention_days)
         with log_path.open("x", encoding="utf-8") as log_file:
             os.chmod(log_path, 0o640)
             log_file.write("AGV Monitor high-utilisation diagnostic snapshot\n")
@@ -425,7 +490,7 @@ def write_snapshot(triggered: set[str], sample: dict, disk_path: str) -> None:
                 "Thresholds: "
                 + ", ".join(
                     f"{label} {threshold:.0f}{'°C' if label == 'Temperature' else '%'}"
-                    for label, (_key, threshold) in SNAPSHOT_METRICS.items()
+                    for label, threshold in thresholds.items()
                 )
                 + "\n"
             )
@@ -469,24 +534,21 @@ def write_snapshot(triggered: set[str], sample: dict, disk_path: str) -> None:
                     f"{size:>14,} bytes  {file_path}" for size, file_path in largest
                 ) or "No regular files found."
                 write_section(log_file, "LARGEST FILES", file_list)
+        content = log_path.read_text(encoding="utf-8", errors="replace")
+        encoded_content = content.encode("utf-8")
+        if len(encoded_content) > MAX_SNAPSHOT_TRANSPORT_BYTES:
+            content = encoded_content[:MAX_SNAPSHOT_TRANSPORT_BYTES].decode(
+                "utf-8", errors="ignore"
+            ) + "\n… snapshot upload truncated; see the local log for the complete content.\n"
         LOG.warning("Wrote high-utilisation diagnostic snapshot to %s", log_path)
+        return {
+            "captured_at": timestamp.isoformat(),
+            "triggered_metrics": sorted(triggered),
+            "content": content,
+        }
     except OSError as error:
         LOG.error("Unable to write high-utilisation diagnostic snapshot: %s", error)
-    finally:
-        SNAPSHOT_LOCK.release()
-
-
-def capture_snapshot_async(triggered: set[str], sample: dict, disk_path: str) -> None:
-    """Start one diagnostic snapshot without delaying regular telemetry collection."""
-    if not SNAPSHOT_LOCK.acquire(blocking=False):
-        LOG.warning("High-utilisation snapshot already in progress; skipping duplicate capture")
-        return
-    Thread(
-        target=write_snapshot,
-        args=(triggered, sample.copy(), disk_path),
-        name="agv-monitor-snapshot",
-        daemon=True,
-    ).start()
+    return None
 
 
 def upload(config: dict[str, str]) -> bool:
@@ -520,6 +582,7 @@ def stop_handler(_signum: int, _frame: object) -> None:
 
 def main() -> int:
     config = load_config()
+    synchronise_snapshot_settings(config)
     sample_every = float(config["SAMPLE_INTERVAL_SECONDS"])
     upload_every = float(config["UPLOAD_INTERVAL_SECONDS"])
     if sample_every * MAX_BATCH_SIZE < upload_every:
@@ -530,17 +593,23 @@ def main() -> int:
     previous_network = None
     previous_disk_io = None
     active_high_metrics: set[str] = set()
-    cleanup_snapshot_logs()
-    next_snapshot_cleanup = time.monotonic() + SNAPSHOT_CLEANUP_INTERVAL_SECONDS
+    thresholds = snapshot_thresholds(config)
+    retention_days = int(config["SNAPSHOT_LOG_RETENTION_DAYS"])
+    cleanup_snapshot_logs(retention_days)
+    next_midday_maintenance = time.monotonic() + seconds_until_next_midday()
     next_sample = time.monotonic()
     # CPU and network utilisation are rates. Wait for the second collection
     # before the first upload so the dashboard never receives a baseline 0/—.
     next_upload = next_sample + sample_every
     while not STOP_REQUESTED:
         now = time.monotonic()
-        if now >= next_snapshot_cleanup:
-            cleanup_snapshot_logs()
-            next_snapshot_cleanup = now + SNAPSHOT_CLEANUP_INTERVAL_SECONDS
+        if now >= next_midday_maintenance:
+            synchronise_snapshot_settings(config)
+            thresholds = snapshot_thresholds(config)
+            retention_days = int(config["SNAPSHOT_LOG_RETENTION_DAYS"])
+            cleanup_snapshot_logs(retention_days)
+            active_high_metrics = set()
+            next_midday_maintenance = time.monotonic() + seconds_until_next_midday()
         if now >= next_sample:
             try:
                 sample, previous_cpu, previous_network, previous_disk_io = collect(
@@ -549,10 +618,18 @@ def main() -> int:
                     previous_disk_io,
                     config["DISK_PATH"],
                 )
-                high_metrics = high_utilisation_metrics(sample)
+                high_metrics = high_utilisation_metrics(sample, thresholds)
                 newly_high_metrics = high_metrics - active_high_metrics
                 if newly_high_metrics:
-                    capture_snapshot_async(high_metrics, sample, config["DISK_PATH"])
+                    snapshot = write_snapshot(
+                        high_metrics,
+                        sample,
+                        config["DISK_PATH"],
+                        thresholds,
+                        retention_days,
+                    )
+                    if snapshot:
+                        sample["extra"]["diagnostic_snapshot"] = snapshot
                 active_high_metrics = high_metrics
                 append_sample(Path(config["SPOOL_PATH"]), sample, int(config["MAX_SPOOL_SAMPLES"]))
             except (OSError, ValueError, KeyError) as error:

@@ -28,12 +28,45 @@ prompt_secret() {
     printf '%s' "$entered_value"
 }
 
+prompt_yes_no() {
+    prompt_text=$1
+    default_value=$2
+    printf '%s [%s]: ' "$prompt_text" "$default_value" >&2
+    read -r entered_value
+    case ${entered_value:-$default_value} in
+        Y|y|yes|YES|Yes) return 0 ;;
+        N|n|no|NO|No) return 1 ;;
+        *)
+            echo 'Please enter y or n.' >&2
+            prompt_yes_no "$prompt_text" "$default_value"
+            return $? ;;
+    esac
+}
+
+install_ca_certificate() {
+    ca_source_path=$1
+    ca_destination_path=/usr/local/share/ca-certificates/agv-monitor-ca.crt
+    if [ ! -f "$ca_source_path" ]; then
+        echo "HTTPS was selected, but $ca_source_path is missing." >&2
+        echo 'Copy agv-monitor-ca.crt beside install.sh and run the installer again.' >&2
+        exit 1
+    fi
+    install -m 0644 "$ca_source_path" "$ca_destination_path"
+    update-ca-certificates
+}
+
 install -d -m 0750 /etc/agv-monitor /var/lib/agv-monitor /usr/local/lib/agv-monitor
 install -m 0755 telemetry_agent.py /usr/local/lib/agv-monitor/telemetry_agent.py
 install -m 0644 agv-monitor.service /etc/systemd/system/agv-monitor.service
 if [ ! -f /etc/agv-monitor/telemetry.conf ]; then
     echo 'Configure this device (press Enter to accept a displayed default).'
-    server_url=$(prompt_value 'Server telemetry URL' 'http://monitor.example.com:8080/api/v1/telemetry')
+    if prompt_yes_no 'Use HTTPS with the AGV Monitoring CA (recommended)' 'Y'; then
+        install_ca_certificate ./agv-monitor-ca.crt
+        server_url=$(prompt_value 'Server telemetry URL' 'https://monitor.example.com:8085/api/v1/telemetry')
+    else
+        echo 'Warning: HTTP leaves device tokens and telemetry visible to the network.' >&2
+        server_url=$(prompt_value 'Server telemetry URL' 'http://monitor.example.com:8085/api/v1/telemetry')
+    fi
     device_token=$(prompt_secret 'Device token')
     if [ -z "$device_token" ]; then
         echo 'A device token is required; configuration was not created.' >&2
@@ -55,6 +88,15 @@ if [ ! -f /etc/agv-monitor/telemetry.conf ]; then
         printf '%s\n' 'SPOOL_PATH=/var/lib/agv-monitor/telemetry-spool.jsonl'
         printf 'MAX_SPOOL_SAMPLES=%s\n' "$max_spool_samples"
         printf 'HTTP_TIMEOUT_SECONDS=%s\n' "$http_timeout"
+        printf '%s\n' 'SNAPSHOT_CPU_THRESHOLD_PERCENT=95'
+        printf '%s\n' 'SNAPSHOT_MEMORY_THRESHOLD_PERCENT=95'
+        printf '%s\n' 'SNAPSHOT_STORAGE_THRESHOLD_PERCENT=90'
+        printf '%s\n' 'SNAPSHOT_DISK_IO_THRESHOLD_PERCENT=95'
+        printf '%s\n' 'SNAPSHOT_SWAP_THRESHOLD_PERCENT=95'
+        printf '%s\n' 'SNAPSHOT_ETH0_THRESHOLD_PERCENT=95'
+        printf '%s\n' 'SNAPSHOT_ETH1_THRESHOLD_PERCENT=95'
+        printf '%s\n' 'SNAPSHOT_TEMPERATURE_THRESHOLD_C=80'
+        printf '%s\n' 'SNAPSHOT_LOG_RETENTION_DAYS=30'
     } > /etc/agv-monitor/telemetry.conf
     chmod 0600 /etc/agv-monitor/telemetry.conf
     systemctl daemon-reload
