@@ -8,6 +8,20 @@ After a daemon start, the first upload occurs after the second sample (five
 seconds with the default configuration). This gives CPU and network utilisation
 enough counter history to report meaningful percentages immediately.
 
+## High-utilisation diagnostic snapshots
+
+When a metric first crosses its threshold, the agent writes a timestamped
+diagnostic file to `/var/log/AGV-Monitor-<UTC timestamp>.log`. It captures the
+triggering telemetry, top CPU and memory processes (including user, PID, and
+command), memory, disk I/O, network counters, socket summary, and Raspberry Pi
+thermal-throttling status when available. Storage events also include the 30
+largest regular files on the monitored filesystem.
+
+Thresholds are CPU/RAM/Disk I/O/Swap/eth0/eth1 at 95%, Storage at 90%, and CPU
+temperature at 80°C. A sustained breach creates one snapshot on entry rather
+than every sampling interval. Snapshot logs are removed automatically after 30
+days.
+
 ## Install on each device
 
 Copy this directory to the device and run:
@@ -32,6 +46,6 @@ sudo systemctl restart agv-monitor
 sudo systemctl status agv-monitor
 ```
 
-The service has no third-party dependencies and runs as root only because the unit's filesystem hardening requires a root-managed configuration and state directory. The process itself only reads `/proc` and `/sys`, and writes its queue under `/var/lib/agv-monitor`.
+The service has no third-party dependencies and runs as root only because the unit's filesystem hardening requires root-managed configuration, state, and diagnostic log directories. The process reads `/proc` and `/sys`, writes its queue under `/var/lib/agv-monitor`, and writes high-utilisation snapshots under `/var/log`.
 
 If you change the sampling interval to below five seconds, increase the upload cadence too: the server accepts no more than 90 readings per request. After an outage, the agent drains queued readings in consecutive 90-reading requests once the server is available.

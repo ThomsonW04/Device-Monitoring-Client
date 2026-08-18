@@ -9,12 +9,16 @@ import logging
 import os
 import signal
 import socket
+import stat
+import subprocess
 import sys
 import time
+from heapq import heappush, heapreplace
 import uuid
 from datetime import datetime, timezone
 from logging.handlers import SysLogHandler
 from pathlib import Path
+from threading import Lock, Thread
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -34,6 +38,21 @@ DEFAULTS = {
 MAX_BATCH_SIZE = 90  # The server API's explicit maximum.
 NETWORK_INTERFACES = ("eth0", "eth1")
 STOP_REQUESTED = False
+SNAPSHOT_LOG_DIRECTORY = Path("/var/log")
+SNAPSHOT_LOG_PREFIX = "AGV-Monitor-"
+SNAPSHOT_RETENTION_SECONDS = 30 * 24 * 60 * 60
+SNAPSHOT_CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
+SNAPSHOT_LOCK = Lock()
+SNAPSHOT_METRICS = {
+    "CPU": ("cpu_percent", 95.0),
+    "Memory": ("memory_percent", 95.0),
+    "Storage": ("disk_percent", 90.0),
+    "Disk I/O": ("disk_io_percent", 95.0),
+    "Swap": ("swap_percent", 95.0),
+    "eth0": ("eth0_percent", 95.0),
+    "eth1": ("eth1_percent", 95.0),
+    "Temperature": ("cpu_temp_c", 80.0),
+}
 
 
 def configure_logging() -> logging.Logger:
@@ -267,6 +286,168 @@ def remove_sent_samples(spool_path: Path, count: int) -> None:
     rewrite_spool(spool_path, pending_samples(spool_path)[count:])
 
 
+def high_utilisation_metrics(sample: dict) -> set[str]:
+    """Return monitored metrics at or above their diagnostic snapshot threshold."""
+    return {
+        label
+        for label, (key, threshold) in SNAPSHOT_METRICS.items()
+        if sample.get(key) is not None and float(sample[key]) >= threshold
+    }
+
+
+def command_output(command: list[str], line_limit: int = 80) -> str:
+    """Capture a bounded command output for a diagnostic snapshot."""
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f"Unable to run {' '.join(command)}: {error}\n"
+
+    output = completed.stdout
+    if completed.stderr:
+        output += f"\n[stderr]\n{completed.stderr}"
+    lines = output.splitlines()
+    if len(lines) > line_limit:
+        lines = lines[:line_limit] + [f"… output limited to {line_limit} lines"]
+    return "\n".join(lines) + "\n"
+
+
+def file_contents(path: Path, line_limit: int = 120) -> str:
+    """Read a kernel status file without allowing one large file to dominate a log."""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as error:
+        return f"Unable to read {path}: {error}\n"
+    if len(lines) > line_limit:
+        lines = lines[:line_limit] + [f"… output limited to {line_limit} lines"]
+    return "\n".join(lines) + "\n"
+
+
+def largest_files(path: str, limit: int = 30) -> list[tuple[int, str]]:
+    """Find the largest regular files on the monitored filesystem only."""
+    root = Path(path)
+    try:
+        filesystem_id = root.stat().st_dev
+    except OSError as error:
+        return [(0, f"Unable to inspect {root}: {error}")]
+
+    files: list[tuple[int, str]] = []
+    for directory, _subdirectories, names in os.walk(root, topdown=True, followlinks=False):
+        for name in names:
+            file_path = Path(directory) / name
+            try:
+                metadata = file_path.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if metadata.st_dev != filesystem_id or not stat.S_ISREG(metadata.st_mode):
+                continue
+            entry = (metadata.st_size, str(file_path))
+            if len(files) < limit:
+                heappush(files, entry)
+            elif entry[0] > files[0][0]:
+                heapreplace(files, entry)
+    return sorted(files, reverse=True)
+
+
+def cleanup_snapshot_logs() -> None:
+    """Remove this agent's diagnostic snapshots once they are older than 30 days."""
+    cutoff = time.time() - SNAPSHOT_RETENTION_SECONDS
+    for log_path in SNAPSHOT_LOG_DIRECTORY.glob(f"{SNAPSHOT_LOG_PREFIX}*.log"):
+        try:
+            if log_path.stat().st_mtime < cutoff:
+                log_path.unlink()
+        except OSError as error:
+            LOG.warning("Unable to remove old diagnostic snapshot %s: %s", log_path, error)
+
+
+def write_section(log_file, title: str, content: str) -> None:
+    log_file.write(f"\n{'=' * 20} {title} {'=' * 20}\n")
+    log_file.write(content.rstrip() + "\n")
+
+
+def write_snapshot(triggered: set[str], sample: dict, disk_path: str) -> None:
+    """Write an htop-style diagnostic snapshot after a high-utilisation crossing."""
+    timestamp = datetime.now(timezone.utc)
+    log_path = SNAPSHOT_LOG_DIRECTORY / (
+        f"{SNAPSHOT_LOG_PREFIX}{timestamp.strftime('%Y%m%dT%H%M%S.%fZ')}.log"
+    )
+    try:
+        cleanup_snapshot_logs()
+        with log_path.open("x", encoding="utf-8") as log_file:
+            os.chmod(log_path, 0o640)
+            log_file.write("AGV Monitor high-utilisation diagnostic snapshot\n")
+            log_file.write(f"Captured (UTC): {timestamp.isoformat()}\n")
+            log_file.write(
+                "Thresholds: "
+                + ", ".join(
+                    f"{label} {threshold:.0f}{'°C' if label == 'Temperature' else '%'}"
+                    for label, (_key, threshold) in SNAPSHOT_METRICS.items()
+                )
+                + "\n"
+            )
+            log_file.write(f"Triggered by: {', '.join(sorted(triggered))}\n")
+            write_section(log_file, "TRIGGERING TELEMETRY", json.dumps(sample, indent=2, sort_keys=True))
+            write_section(
+                log_file,
+                "SYSTEM",
+                "\n".join(
+                    (
+                        f"Hostname: {socket.gethostname()}",
+                        f"Kernel: {os.uname().sysname} {os.uname().release}",
+                        f"CPU cores: {os.cpu_count() or 'unknown'}",
+                        f"Load averages: {os.getloadavg()}",
+                        f"Uptime seconds: {uptime_seconds()}",
+                    )
+                ),
+            )
+            write_section(log_file, "TOP CPU PROCESSES", command_output([
+                "ps", "-eo", "user:16,pid,ppid,ni,stat,pcpu,pmem,rss,vsz,etime,comm,args", "--sort=-pcpu"
+            ], line_limit=41))
+            write_section(log_file, "TOP MEMORY PROCESSES", command_output([
+                "ps", "-eo", "user:16,pid,ppid,ni,stat,pcpu,pmem,rss,vsz,etime,comm,args", "--sort=-pmem"
+            ], line_limit=41))
+            write_section(log_file, "MEMORY", file_contents(Path("/proc/meminfo")))
+            write_section(log_file, "MEMORY SUMMARY", command_output(["free", "-h"]))
+            write_section(log_file, "DISK SPACE", command_output(["df", "-h", disk_path]))
+            write_section(log_file, "DISK I/O COUNTERS", file_contents(Path("/proc/diskstats")))
+            write_section(log_file, "NETWORK COUNTERS", file_contents(Path("/proc/net/dev")))
+            write_section(log_file, "ETH0 DETAILS", command_output(["ip", "-s", "link", "show", "eth0"]))
+            write_section(log_file, "ETH1 DETAILS", command_output(["ip", "-s", "link", "show", "eth1"]))
+            write_section(log_file, "NETWORK SOCKET SUMMARY", command_output(["ss", "-s"]))
+            write_section(log_file, "RASPBERRY PI THERMAL STATUS", command_output([
+                "vcgencmd", "get_throttled"
+            ]))
+            if "Storage" in triggered:
+                largest = largest_files(disk_path)
+                file_list = "\n".join(
+                    f"{size:>14,} bytes  {file_path}" for size, file_path in largest
+                ) or "No regular files found."
+                write_section(log_file, "LARGEST FILES", file_list)
+        LOG.warning("Wrote high-utilisation diagnostic snapshot to %s", log_path)
+    except OSError as error:
+        LOG.error("Unable to write high-utilisation diagnostic snapshot: %s", error)
+    finally:
+        SNAPSHOT_LOCK.release()
+
+
+def capture_snapshot_async(triggered: set[str], sample: dict, disk_path: str) -> None:
+    """Start one diagnostic snapshot without delaying regular telemetry collection."""
+    if not SNAPSHOT_LOCK.acquire(blocking=False):
+        LOG.warning("High-utilisation snapshot already in progress; skipping duplicate capture")
+        return
+    Thread(
+        target=write_snapshot,
+        args=(triggered, sample.copy(), disk_path),
+        name="agv-monitor-snapshot",
+        daemon=True,
+    ).start()
+
+
 def upload(config: dict[str, str]) -> bool:
     spool_path = Path(config["SPOOL_PATH"])
     while samples := pending_samples(spool_path)[:MAX_BATCH_SIZE]:
@@ -307,12 +488,18 @@ def main() -> int:
     previous_cpu = None
     previous_network = None
     previous_disk_io = None
+    active_high_metrics: set[str] = set()
+    cleanup_snapshot_logs()
+    next_snapshot_cleanup = time.monotonic() + SNAPSHOT_CLEANUP_INTERVAL_SECONDS
     next_sample = time.monotonic()
     # CPU and network utilisation are rates. Wait for the second collection
     # before the first upload so the dashboard never receives a baseline 0/—.
     next_upload = next_sample + sample_every
     while not STOP_REQUESTED:
         now = time.monotonic()
+        if now >= next_snapshot_cleanup:
+            cleanup_snapshot_logs()
+            next_snapshot_cleanup = now + SNAPSHOT_CLEANUP_INTERVAL_SECONDS
         if now >= next_sample:
             try:
                 sample, previous_cpu, previous_network, previous_disk_io = collect(
@@ -321,6 +508,11 @@ def main() -> int:
                     previous_disk_io,
                     config["DISK_PATH"],
                 )
+                high_metrics = high_utilisation_metrics(sample)
+                newly_high_metrics = high_metrics - active_high_metrics
+                if newly_high_metrics:
+                    capture_snapshot_async(high_metrics, sample, config["DISK_PATH"])
+                active_high_metrics = high_metrics
                 append_sample(Path(config["SPOOL_PATH"]), sample, int(config["MAX_SPOOL_SAMPLES"]))
             except (OSError, ValueError, KeyError) as error:
                 LOG.exception("Unable to collect telemetry: %s", error)

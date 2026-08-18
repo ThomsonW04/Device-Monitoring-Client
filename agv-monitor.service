@@ -14,7 +14,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
-ReadWritePaths=/var/lib/agv-monitor
+ReadWritePaths=/var/lib/agv-monitor /var/log
 TimeoutStopSec=30
 
 [Install]
