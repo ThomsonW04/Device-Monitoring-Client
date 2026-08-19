@@ -145,6 +145,7 @@ if [ ! -f /etc/agv-monitor/telemetry.conf ]; then
         printf 'SERVER_URL=%s\n' "$server_url"
         printf 'DEVICE_TOKEN=%s\n' "$device_token"
         printf 'SAMPLE_INTERVAL_SECONDS=%s\n' "$sample_interval"
+        printf '%s\n' 'INTERNAL_SAMPLE_INTERVAL_SECONDS=0.5'
         printf 'UPLOAD_INTERVAL_SECONDS=%s\n' "$upload_interval"
         printf 'DISK_PATH=%s\n' "$disk_path"
         printf '%s\n' 'SPOOL_PATH=/var/lib/agv-monitor/telemetry-spool.jsonl'

@@ -27,10 +27,12 @@ from urllib.request import Request, urlopen
 
 # All device-specific settings belong in the EnvironmentFile specified here.
 CONFIG_PATH = Path(os.environ.get("AGV_MONITOR_CONFIG", "/etc/agv-monitor/telemetry.conf"))
+AGENT_VERSION = "1.0.4"
 DEFAULTS = {
     "SERVER_URL": "https://10.54.168.13:8085/api/v1/telemetry",
     "DEVICE_TOKEN": "",
     "SAMPLE_INTERVAL_SECONDS": "5",
+    "INTERNAL_SAMPLE_INTERVAL_SECONDS": "0.5",
     "UPLOAD_INTERVAL_SECONDS": "300",
     "DISK_PATH": "/",
     "SPOOL_PATH": "/var/lib/agv-monitor/telemetry-spool.jsonl",
@@ -126,7 +128,10 @@ def load_config() -> dict[str, str]:
     config.update({key: os.environ[key] for key in DEFAULTS if key in os.environ})
     if not config["DEVICE_TOKEN"] or config["DEVICE_TOKEN"] == "replace-with-device-token":
         raise ValueError("DEVICE_TOKEN must be set in " + str(CONFIG_PATH))
-    for key in ("SAMPLE_INTERVAL_SECONDS", "UPLOAD_INTERVAL_SECONDS", "HTTP_TIMEOUT_SECONDS"):
+    for key in (
+        "SAMPLE_INTERVAL_SECONDS", "INTERNAL_SAMPLE_INTERVAL_SECONDS",
+        "UPLOAD_INTERVAL_SECONDS", "HTTP_TIMEOUT_SECONDS",
+    ):
         if float(config[key]) <= 0:
             raise ValueError(f"{key} must be greater than zero")
     if int(config["MAX_SPOOL_SAMPLES"]) <= 0:
@@ -186,6 +191,7 @@ def process_cpu_times() -> dict[tuple[int, int], dict[str, int | str]]:
                 "nice": int(fields[16]),
                 "state": fields[0],
                 "command": command,
+                "start_time": start_time,
                 "ticks": user_ticks + system_ticks,
             }
         except (IndexError, KeyError, OSError, ValueError):
@@ -221,34 +227,105 @@ def process_cpu_attribution(
 
 
 def process_cpu_output(
-    rows: list[dict[str, int | str | float]],
-    accounted_percent: float,
+    persistent_rows: list[dict[str, int | str | float]],
+    persistent_percent: float,
+    transient_rows: list[dict[str, int | str | float]],
+    transient_percent: float,
     system_cpu_percent: float,
     cpu_count: int,
     limit: int = 40,
 ) -> str:
-    """Format process CPU deltas measured during the triggering interval."""
+    """Format persistent and observed transient process CPU attribution."""
     lines = [
-        "Each value is measured over the same interval as the CPU alert.",
+        "Persistent rows span the full alert interval; transient rows were observed in one-second samples.",
         "USER                 PID    PPID  NI STAT SYSTEM% CORE%  TICKS COMMAND",
     ]
-    for row in rows[:limit]:
+    for row in persistent_rows[:limit]:
         system_percent = float(row["system_percent"])
         lines.append(
             f"{str(row['user'])[:16]:<16} {int(row['pid']):>7} {int(row['ppid']):>7} "
             f"{int(row['nice']):>3} {str(row['state']):<4} {system_percent:>6.1f} "
             f"{system_percent * cpu_count:>5.1f} {int(row['tick_delta']):>6} {row['command']}"
         )
-    if len(rows) > limit:
-        lines.append(f"… {len(rows) - limit} lower-CPU processes omitted")
-    unattributed = max(0.0, system_cpu_percent - accounted_percent)
+    if len(persistent_rows) > limit:
+        lines.append(f"… {len(persistent_rows) - limit} lower-CPU processes omitted")
+    if transient_rows:
+        lines.extend(("", "OBSERVED NEW/SHORT-LIVED PROCESSES (PARTIAL INTERVAL CPU)"))
+        for row in transient_rows[:limit]:
+            system_percent = float(row["system_percent"])
+            lines.append(
+                f"{str(row['user'])[:16]:<16} {int(row['pid']):>7} {int(row['ppid']):>7} "
+                f"{int(row['nice']):>3} {str(row['state']):<4} {system_percent:>6.1f} "
+                f"{system_percent * cpu_count:>5.1f} {int(row['tick_delta']):>6} {row['command']}"
+            )
+        if len(transient_rows) > limit:
+            lines.append(f"… {len(transient_rows) - limit} lower-CPU processes omitted")
+    unattributed = max(0.0, system_cpu_percent - persistent_percent - transient_percent)
     lines.extend((
         "",
         f"System CPU: {system_cpu_percent:.1f}%",
-        f"Processes accounted for: {accounted_percent:.1f}%",
-        f"Kernel/interrupts or processes outside interval: {unattributed:.1f}%",
+        f"Persistent processes accounted for: {persistent_percent:.1f}%",
+        f"Observed new/short-lived process CPU: {transient_percent:.1f}%",
+        f"Kernel/interrupts or still-unobserved CPU: {unattributed:.1f}%",
     ))
     return "\n".join(lines) + "\n"
+
+
+WINDOW_METRICS = (
+    "cpu_percent", "memory_percent", "swap_percent", "disk_percent",
+    "disk_io_percent", "cpu_temp_c", "load_1m", "eth0_percent", "eth1_percent",
+)
+
+
+def aggregate_window(
+    samples: list[dict],
+    cpu_start: tuple[int, int] | None = None,
+    cpu_end: tuple[int, int] | None = None,
+) -> tuple[dict, str]:
+    """Return one five-second telemetry record plus its average/min/max evidence."""
+    if not samples:
+        raise ValueError("Cannot aggregate an empty telemetry window")
+    aggregate = dict(samples[-1])
+    aggregate["extra"] = dict(samples[-1]["extra"])
+    summary = ["METRIC                    AVERAGE     MINIMUM     MAXIMUM"]
+    for metric in WINDOW_METRICS:
+        values = [float(sample[metric]) for sample in samples if sample.get(metric) is not None]
+        if not values:
+            aggregate[metric] = None
+            continue
+        aggregate[metric] = round(sum(values) / len(values), 2)
+        summary.append(
+            f"{metric:<25} {aggregate[metric]:>7.2f} {min(values):>11.2f} {max(values):>11.2f}"
+        )
+    if cpu_start is not None and cpu_end is not None:
+        total_delta = cpu_end[0] - cpu_start[0]
+        idle_delta = cpu_end[1] - cpu_start[1]
+        if total_delta > 0:
+            aggregate["cpu_percent"] = round(
+                max(0.0, min(100.0, (1 - idle_delta / total_delta) * 100)), 1
+            )
+            summary[1] = (
+                f"{'cpu_percent':<25} {aggregate['cpu_percent']:>7.2f} "
+                f"{min(float(item['cpu_percent']) for item in samples):>11.2f} "
+                f"{max(float(item['cpu_percent']) for item in samples):>11.2f}"
+            )
+    for metric in ("eth0_link_up", "eth1_link_up"):
+        aggregate[metric] = all(bool(sample.get(metric)) for sample in samples)
+    return aggregate, "\n".join(summary) + "\n"
+
+
+def accumulate_process_rows(
+    totals: dict[tuple[int, int], dict[str, int | str | float]],
+    rows: list[dict[str, int | str | float]],
+) -> None:
+    """Accumulate one-second process deltas for later transient-process evidence."""
+    for row in rows:
+        identity = (int(row["pid"]), int(row["start_time"]))
+        existing = totals.get(identity)
+        if existing is None:
+            totals[identity] = dict(row)
+        else:
+            existing["tick_delta"] = int(existing["tick_delta"]) + int(row["tick_delta"])
 
 
 def memory_percent() -> float:
@@ -399,7 +476,7 @@ def collect(
         "eth1_percent": network["eth1"],
         "eth0_link_up": link_up["eth0"],
         "eth1_link_up": link_up["eth1"],
-        "extra": {"hostname": socket.gethostname()},
+        "extra": {},
     }, current_cpu, current_processes, current_network, current_disk_io, process_cpu, accounted_cpu
 
 
@@ -615,6 +692,9 @@ def write_snapshot(
     sample: dict,
     process_cpu_rows: list[dict[str, int | str | float]],
     process_cpu_accounted_percent: float,
+    transient_process_rows: list[dict[str, int | str | float]],
+    transient_process_percent: float,
+    window_summary: str,
     disk_path: str,
     thresholds: dict[str, float],
     retention_days: int,
@@ -629,6 +709,7 @@ def write_snapshot(
         with log_path.open("x", encoding="utf-8") as log_file:
             os.chmod(log_path, 0o640)
             log_file.write("AGV Monitor high-utilisation diagnostic snapshot\n")
+            log_file.write(f"Telemetry agent version: {AGENT_VERSION}\n")
             log_file.write(f"Captured (UTC): {timestamp.isoformat()}\n")
             log_file.write(
                 "Thresholds: "
@@ -640,12 +721,13 @@ def write_snapshot(
             )
             log_file.write(f"Triggered by: {', '.join(sorted(triggered))}\n")
             write_section(log_file, "TRIGGERING TELEMETRY", json.dumps(sample, indent=2, sort_keys=True))
+            write_section(log_file, "FIVE-SECOND WINDOW SUMMARY", window_summary)
             write_section(
                 log_file,
                 "SYSTEM",
                 "\n".join(
                     (
-                        f"Hostname: {sample['extra']['hostname']}",
+                        f"Hostname: {socket.gethostname()}",
                         f"Kernel: {os.uname().sysname} {os.uname().release}",
                         f"CPU cores: {os.cpu_count() or 'unknown'}",
                         f"Load average (trigger sample, 1m): {sample['load_1m']}",
@@ -669,6 +751,8 @@ def write_snapshot(
                 process_cpu_output(
                     process_cpu_rows,
                     process_cpu_accounted_percent,
+                    transient_process_rows,
+                    transient_process_percent,
                     float(sample["cpu_percent"]),
                     os.cpu_count() or 1,
                 ),
@@ -745,6 +829,9 @@ def main() -> int:
     config = load_config()
     synchronise_snapshot_settings(config)
     sample_every = float(config["SAMPLE_INTERVAL_SECONDS"])
+    internal_sample_every = float(config["INTERNAL_SAMPLE_INTERVAL_SECONDS"])
+    if internal_sample_every > sample_every:
+        raise ValueError("INTERNAL_SAMPLE_INTERVAL_SECONDS cannot exceed SAMPLE_INTERVAL_SECONDS")
     upload_every = float(config["UPLOAD_INTERVAL_SECONDS"])
     if sample_every * MAX_BATCH_SIZE < upload_every:
         LOG.warning("Upload interval produces more than %s samples; multiple uploads will be required", MAX_BATCH_SIZE)
@@ -754,15 +841,20 @@ def main() -> int:
     previous_processes = None
     previous_network = None
     previous_disk_io = None
+    window_start_cpu = None
+    window_start_processes = None
+    window_process_totals: dict[tuple[int, int], dict[str, int | str | float]] = {}
+    window_samples: list[dict] = []
     active_high_metrics: set[str] = set()
     thresholds = snapshot_thresholds(config)
     retention_days = int(config["SNAPSHOT_LOG_RETENTION_DAYS"])
     cleanup_snapshot_logs(retention_days)
     next_midday_maintenance = time.monotonic() + seconds_until_next_midday()
-    next_sample = time.monotonic()
-    # CPU and network utilisation are rates. Wait for the second collection
-    # before the first upload so the dashboard never receives a baseline 0/—.
-    next_upload = next_sample + sample_every
+    next_internal_sample = time.monotonic()
+    next_sample = next_internal_sample + sample_every
+    # CPU and network utilisation are rates. Wait for the first full telemetry
+    # window before upload so the dashboard never receives a baseline 0/—.
+    next_upload = next_sample
     while not STOP_REQUESTED:
         now = time.monotonic()
         if now >= next_midday_maintenance:
@@ -772,10 +864,10 @@ def main() -> int:
             cleanup_snapshot_logs(retention_days)
             active_high_metrics = set()
             next_midday_maintenance = time.monotonic() + seconds_until_next_midday()
-        if now >= next_sample:
+        if now >= next_internal_sample:
             try:
                 (
-                    sample,
+                    internal_sample,
                     previous_cpu,
                     previous_processes,
                     previous_network,
@@ -789,33 +881,78 @@ def main() -> int:
                     previous_disk_io,
                     config["DISK_PATH"],
                 )
-                high_metrics = high_utilisation_metrics(sample, thresholds)
-                newly_high_metrics = high_metrics - active_high_metrics
-                if newly_high_metrics:
-                    snapshot = write_snapshot(
-                        high_metrics,
-                        sample,
-                        process_cpu_rows,
-                        process_cpu_accounted_percent,
-                        config["DISK_PATH"],
-                        thresholds,
-                        retention_days,
+                if window_start_cpu is None:
+                    window_start_cpu = previous_cpu
+                    window_start_processes = previous_processes
+                else:
+                    window_samples.append(internal_sample)
+                    accumulate_process_rows(window_process_totals, process_cpu_rows)
+                if now >= next_sample and window_samples and window_start_cpu and window_start_processes:
+                    sample, window_summary = aggregate_window(
+                        window_samples, window_start_cpu, previous_cpu
                     )
-                    if snapshot:
-                        sample["extra"]["diagnostic_snapshot"] = snapshot
-                active_high_metrics = high_metrics
-                append_sample(Path(config["SPOOL_PATH"]), sample, int(config["MAX_SPOOL_SAMPLES"]))
+                    total_cpu_delta = previous_cpu[0] - window_start_cpu[0]
+                    process_cpu_rows, process_cpu_accounted_percent = process_cpu_attribution(
+                        window_start_processes, previous_processes, total_cpu_delta
+                    )
+                    persistent_identities = {
+                        (int(row["pid"]), int(row["start_time"])) for row in process_cpu_rows
+                    }
+                    transient_process_rows = []
+                    for identity, row in window_process_totals.items():
+                        if identity in persistent_identities:
+                            continue
+                        row = dict(row)
+                        row["system_percent"] = int(row["tick_delta"]) * 100 / total_cpu_delta if total_cpu_delta else 0.0
+                        transient_process_rows.append(row)
+                    transient_process_rows.sort(key=lambda row: float(row["system_percent"]), reverse=True)
+                    transient_process_percent = sum(
+                        float(row["system_percent"]) for row in transient_process_rows
+                    )
+                    high_metrics = high_utilisation_metrics(sample, thresholds)
+                    newly_high_metrics = high_metrics - active_high_metrics
+                    if newly_high_metrics:
+                        snapshot = write_snapshot(
+                            high_metrics,
+                            sample,
+                            process_cpu_rows,
+                            process_cpu_accounted_percent,
+                            transient_process_rows,
+                            transient_process_percent,
+                            window_summary,
+                            config["DISK_PATH"],
+                            thresholds,
+                            retention_days,
+                        )
+                        if snapshot:
+                            sample["extra"]["diagnostic_snapshot"] = snapshot
+                    active_high_metrics = high_metrics
+                    if not sample["extra"]:
+                        sample.pop("extra")
+                    append_sample(Path(config["SPOOL_PATH"]), sample, int(config["MAX_SPOOL_SAMPLES"]))
+                    window_start_cpu = previous_cpu
+                    window_start_processes = previous_processes
+                    window_process_totals = {}
+                    window_samples = []
+                    next_sample += sample_every
+                    if next_sample <= now:
+                        next_sample = now + sample_every
             except (OSError, ValueError, KeyError) as error:
                 LOG.exception("Unable to collect telemetry: %s", error)
-            next_sample += sample_every
-            if next_sample <= now:
-                next_sample = now + sample_every
+            next_internal_sample += internal_sample_every
+            if next_internal_sample <= now:
+                next_internal_sample = now + internal_sample_every
         if now >= next_upload:
             upload(config)
             next_upload += upload_every
             if next_upload <= now:
                 next_upload = now + upload_every
-        time.sleep(min(1.0, max(0.05, next_sample - time.monotonic(), next_upload - time.monotonic())))
+        time.sleep(min(1.0, max(
+            0.05,
+            next_internal_sample - time.monotonic(),
+            next_sample - time.monotonic(),
+            next_upload - time.monotonic(),
+        )))
     upload(config)  # Best effort flush when systemd stops the service.
     return 0
 

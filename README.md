@@ -73,6 +73,12 @@ certificate. It adds this CA to the Pi's system trust store using
 plain-HTTP server: HTTP exposes telemetry, device tokens, and the one-time
 registration credentials to the network.
 
+The agent takes lightweight internal readings twice per second and combines them
+into the configured five-second telemetry interval. Upload batching remains
+controlled by `UPLOAD_INTERVAL_SECONDS` (five minutes by default). Snapshot
+logs include one-second process evidence for short-lived workloads as well as
+five-second average/minimum/maximum metric values.
+
 Rerun the current `install.sh` on every existing HTTPS device after a CA
 rotation. It preserves the device configuration, replaces the installed AGV
 Monitoring CA, and restarts the service.
