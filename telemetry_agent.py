@@ -156,6 +156,101 @@ def cpu_percent(previous: tuple[int, int] | None) -> tuple[float, tuple[int, int
     return round(max(0.0, min(100.0, usage)), 1), current
 
 
+def process_cpu_times() -> dict[tuple[int, int], dict[str, int | str]]:
+    """Read per-process CPU counters without running a diagnostic command.
+
+    The process start time is part of the key so a reused PID cannot be mistaken
+    for the process present at the beginning of the sampling interval.
+    """
+    processes: dict[tuple[int, int], dict[str, int | str]] = {}
+    for process_path in Path("/proc").iterdir():
+        if not process_path.name.isdigit():
+            continue
+        try:
+            stat_line = (process_path / "stat").read_text(encoding="utf-8")
+            command_end = stat_line.rfind(")")
+            if command_end < 0:
+                continue
+            pid = int(process_path.name)
+            command = stat_line[stat_line.find("(") + 1:command_end]
+            fields = stat_line[command_end + 2:].split()
+            # These indexes are relative to Linux proc(5) field 3 (state).
+            start_time = int(fields[19])
+            user_ticks = int(fields[11])
+            system_ticks = int(fields[12])
+            user = pwd.getpwuid(process_path.stat().st_uid).pw_name
+            processes[(pid, start_time)] = {
+                "user": user,
+                "pid": pid,
+                "ppid": int(fields[1]),
+                "nice": int(fields[16]),
+                "state": fields[0],
+                "command": command,
+                "ticks": user_ticks + system_ticks,
+            }
+        except (IndexError, KeyError, OSError, ValueError):
+            continue
+    return processes
+
+
+def process_cpu_attribution(
+    previous: dict[tuple[int, int], dict[str, int | str]] | None,
+    current: dict[tuple[int, int], dict[str, int | str]],
+    total_cpu_delta: int,
+) -> tuple[list[dict[str, int | str | float]], float]:
+    """Attribute a system CPU interval to processes present at both endpoints."""
+    if previous is None or total_cpu_delta <= 0:
+        return [], 0.0
+    rows: list[dict[str, int | str | float]] = []
+    accounted_ticks = 0
+    for identity, process in current.items():
+        old_process = previous.get(identity)
+        if old_process is None:
+            continue
+        tick_delta = int(process["ticks"]) - int(old_process["ticks"])
+        if tick_delta <= 0:
+            continue
+        accounted_ticks += tick_delta
+        rows.append({
+            **process,
+            "tick_delta": tick_delta,
+            "system_percent": tick_delta * 100 / total_cpu_delta,
+        })
+    rows.sort(key=lambda row: float(row["system_percent"]), reverse=True)
+    return rows, accounted_ticks * 100 / total_cpu_delta
+
+
+def process_cpu_output(
+    rows: list[dict[str, int | str | float]],
+    accounted_percent: float,
+    system_cpu_percent: float,
+    cpu_count: int,
+    limit: int = 40,
+) -> str:
+    """Format process CPU deltas measured during the triggering interval."""
+    lines = [
+        "Each value is measured over the same interval as the CPU alert.",
+        "USER                 PID    PPID  NI STAT SYSTEM% CORE%  TICKS COMMAND",
+    ]
+    for row in rows[:limit]:
+        system_percent = float(row["system_percent"])
+        lines.append(
+            f"{str(row['user'])[:16]:<16} {int(row['pid']):>7} {int(row['ppid']):>7} "
+            f"{int(row['nice']):>3} {str(row['state']):<4} {system_percent:>6.1f} "
+            f"{system_percent * cpu_count:>5.1f} {int(row['tick_delta']):>6} {row['command']}"
+        )
+    if len(rows) > limit:
+        lines.append(f"… {len(rows) - limit} lower-CPU processes omitted")
+    unattributed = max(0.0, system_cpu_percent - accounted_percent)
+    lines.extend((
+        "",
+        f"System CPU: {system_cpu_percent:.1f}%",
+        f"Processes accounted for: {accounted_percent:.1f}%",
+        f"Kernel/interrupts or processes outside interval: {unattributed:.1f}%",
+    ))
+    return "\n".join(lines) + "\n"
+
+
 def memory_percent() -> float:
     values: dict[str, int] = {}
     for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
@@ -265,16 +360,25 @@ def network_utilisation(
 
 def collect(
     previous_cpu: tuple[int, int] | None,
+    previous_processes: dict[tuple[int, int], dict[str, int | str]] | None,
     previous_network: dict[str, tuple[int, int, float]] | None,
     previous_disk_io: tuple[int, float] | None,
     disk_path: str,
 ) -> tuple[
     dict,
     tuple[int, int],
+    dict[tuple[int, int], dict[str, int | str]],
     dict[str, tuple[int, int, float]],
     tuple[int, float] | None,
+    list[dict[str, int | str | float]],
+    float,
 ]:
     cpu, current_cpu = cpu_percent(previous_cpu)
+    current_processes = process_cpu_times()
+    total_cpu_delta = 0 if previous_cpu is None else current_cpu[0] - previous_cpu[0]
+    process_cpu, accounted_cpu = process_cpu_attribution(
+        previous_processes, current_processes, total_cpu_delta
+    )
     network, link_up, current_network = network_utilisation(previous_network)
     disk_io, current_disk_io = disk_io_percent(previous_disk_io, disk_path)
     try:
@@ -296,7 +400,7 @@ def collect(
         "eth0_link_up": link_up["eth0"],
         "eth1_link_up": link_up["eth1"],
         "extra": {"hostname": socket.gethostname()},
-    }, current_cpu, current_network, current_disk_io
+    }, current_cpu, current_processes, current_network, current_disk_io, process_cpu, accounted_cpu
 
 
 def append_sample(spool_path: Path, sample: dict, maximum_samples: int) -> None:
@@ -509,6 +613,8 @@ def write_section(log_file, title: str, content: str) -> None:
 def write_snapshot(
     triggered: set[str],
     sample: dict,
+    process_cpu_rows: list[dict[str, int | str | float]],
+    process_cpu_accounted_percent: float,
     disk_path: str,
     thresholds: dict[str, float],
     retention_days: int,
@@ -539,27 +645,44 @@ def write_snapshot(
                 "SYSTEM",
                 "\n".join(
                     (
-                        f"Hostname: {socket.gethostname()}",
+                        f"Hostname: {sample['extra']['hostname']}",
                         f"Kernel: {os.uname().sysname} {os.uname().release}",
                         f"CPU cores: {os.cpu_count() or 'unknown'}",
-                        f"Load averages: {os.getloadavg()}",
-                        f"Uptime seconds: {uptime_seconds()}",
+                        f"Load average (trigger sample, 1m): {sample['load_1m']}",
+                        f"Uptime seconds (trigger sample): {sample['uptime_seconds']}",
                     )
                 ),
             )
-            write_section(log_file, "TOP CPU PROCESSES", command_output([
-                "ps", "-eo", "user:16,pid,ppid,ni,stat,pcpu,pmem,rss,vsz,etime,comm", "--sort=-pcpu"
-            ], line_limit=41))
+            write_section(
+                log_file,
+                "MEASUREMENT BASIS",
+                "\n".join((
+                    "CPU and process attribution are deltas from the same sampling interval.",
+                    "Disk I/O and Ethernet utilisation in triggering telemetry are also interval deltas.",
+                    "RAM, swap, storage, temperature, and load are point-in-time kernel readings.",
+                    "The later counter and command sections are current diagnostic context, not trigger values.",
+                )),
+            )
+            write_section(
+                log_file,
+                "CPU INTERVAL ATTRIBUTION",
+                process_cpu_output(
+                    process_cpu_rows,
+                    process_cpu_accounted_percent,
+                    float(sample["cpu_percent"]),
+                    os.cpu_count() or 1,
+                ),
+            )
             write_section(log_file, "TOP MEMORY PROCESSES", command_output([
                 "ps", "-eo", "user:16,pid,ppid,ni,stat,pcpu,pmem,rss,vsz,etime,comm", "--sort=-pmem"
             ], line_limit=41))
-            write_section(log_file, "MEMORY", file_contents(Path("/proc/meminfo")))
-            write_section(log_file, "MEMORY SUMMARY", command_output(["free", "-h"]))
-            write_section(log_file, "DISK SPACE", command_output(["df", "-h", disk_path]))
-            write_section(log_file, "DISK I/O COUNTERS", file_contents(Path("/proc/diskstats")))
+            write_section(log_file, "MEMORY AT SNAPSHOT TIME", file_contents(Path("/proc/meminfo")))
+            write_section(log_file, "MEMORY SUMMARY AT SNAPSHOT TIME", command_output(["free", "-h"]))
+            write_section(log_file, "DISK SPACE AT SNAPSHOT TIME", command_output(["df", "-h", disk_path]))
+            write_section(log_file, "DISK I/O COUNTERS (CUMULATIVE)", file_contents(Path("/proc/diskstats")))
             if "Disk I/O" in triggered:
                 write_section(log_file, "TOP DISK I/O PROCESSES", process_io_output())
-            write_section(log_file, "NETWORK COUNTERS", file_contents(Path("/proc/net/dev")))
+            write_section(log_file, "NETWORK COUNTERS (CUMULATIVE)", file_contents(Path("/proc/net/dev")))
             write_section(log_file, "ETH0 DETAILS", command_output(["ip", "-s", "link", "show", "eth0"]))
             write_section(log_file, "ETH1 DETAILS", command_output(["ip", "-s", "link", "show", "eth1"]))
             write_section(log_file, "NETWORK SOCKET SUMMARY", command_output(["ss", "-s"]))
@@ -628,6 +751,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop_handler)
     signal.signal(signal.SIGINT, stop_handler)
     previous_cpu = None
+    previous_processes = None
     previous_network = None
     previous_disk_io = None
     active_high_metrics: set[str] = set()
@@ -650,8 +774,17 @@ def main() -> int:
             next_midday_maintenance = time.monotonic() + seconds_until_next_midday()
         if now >= next_sample:
             try:
-                sample, previous_cpu, previous_network, previous_disk_io = collect(
+                (
+                    sample,
                     previous_cpu,
+                    previous_processes,
+                    previous_network,
+                    previous_disk_io,
+                    process_cpu_rows,
+                    process_cpu_accounted_percent,
+                ) = collect(
+                    previous_cpu,
+                    previous_processes,
                     previous_network,
                     previous_disk_io,
                     config["DISK_PATH"],
@@ -662,6 +795,8 @@ def main() -> int:
                     snapshot = write_snapshot(
                         high_metrics,
                         sample,
+                        process_cpu_rows,
+                        process_cpu_accounted_percent,
                         config["DISK_PATH"],
                         thresholds,
                         retention_days,
