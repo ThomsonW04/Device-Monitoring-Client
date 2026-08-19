@@ -476,7 +476,7 @@ def collect(
         "eth1_percent": network["eth1"],
         "eth0_link_up": link_up["eth0"],
         "eth1_link_up": link_up["eth1"],
-        "extra": {},
+        "extra": {"agent_version": AGENT_VERSION},
     }, current_cpu, current_processes, current_network, current_disk_io, process_cpu, accounted_cpu
 
 
@@ -709,7 +709,6 @@ def write_snapshot(
         with log_path.open("x", encoding="utf-8") as log_file:
             os.chmod(log_path, 0o640)
             log_file.write("AGV Monitor high-utilisation diagnostic snapshot\n")
-            log_file.write(f"Telemetry agent version: {AGENT_VERSION}\n")
             log_file.write(f"Captured (UTC): {timestamp.isoformat()}\n")
             log_file.write(
                 "Thresholds: "
@@ -927,8 +926,6 @@ def main() -> int:
                         if snapshot:
                             sample["extra"]["diagnostic_snapshot"] = snapshot
                     active_high_metrics = high_metrics
-                    if not sample["extra"]:
-                        sample.pop("extra")
                     append_sample(Path(config["SPOOL_PATH"]), sample, int(config["MAX_SPOOL_SAMPLES"]))
                     window_start_cpu = previous_cpu
                     window_start_processes = previous_processes
