@@ -1,6 +1,6 @@
 # AGV device telemetry agent
 
-A dependency-free Python 3 systemd daemon for Linux/Raspberry Pi. It samples CPU, memory, swap use, system uptime, root storage use, disk read/write active time, CPU temperature, 1-minute load, and `eth0`/`eth1` network utilisation every five seconds, then uploads a batch every five minutes. Disk read/write active time is the percentage of the sample interval that the device was busy serving I/O, equivalent to Task Manager's disk active-time view. Network utilisation is combined receive/send traffic as a percentage of the interface's negotiated link speed. It also reports each port's physical carrier state, allowing the server to alert when a cable or interface goes down. Unsent readings are stored in `/var/lib/agv-monitor/` and retry after networking/server failures.
+A dependency-free Python 3 systemd daemon for Linux/Raspberry Pi. It samples CPU, memory, swap use, system uptime, root storage use, disk read/write active time, CPU temperature, 1-minute load, and `eth0` network utilisation every five seconds, then uploads a batch every five minutes. Disk read/write active time is the percentage of the sample interval that the device was busy serving I/O, equivalent to Task Manager's disk active-time view. Network utilisation is combined receive/send traffic as a percentage of the interface's negotiated link speed. It also reports eth0's physical carrier state, allowing the server to alert when its cable or interface goes down. Unsent readings are stored in `/var/lib/agv-monitor/` and retry after networking/server failures.
 
 The five-second default is intentional: it produces 60 samples per five-minute upload. The server accepts up to 90 samples, leaving 50% headroom for a delayed upload.
 
@@ -20,7 +20,7 @@ but omit their paths. Before writing or uploading a snapshot, the agent also
 redacts common password, token, API-key, bearer-authorization, and URI-password
 formats.
 
-Thresholds are CPU/RAM/Disk I/O/Swap/eth0/eth1 at 95%, Storage at 90%, and CPU
+Thresholds are CPU/RAM/Disk I/O/Swap/eth0 at 95%, Storage at 90%, and CPU
 temperature at 80°C. A snapshot is created every time a metric crosses from
 below its threshold to at or above it. It does not create another snapshot at
 each sampling interval while that same breach remains active. Snapshot logs
@@ -39,7 +39,6 @@ SNAPSHOT_STORAGE_THRESHOLD_PERCENT=90
 SNAPSHOT_DISK_IO_THRESHOLD_PERCENT=95
 SNAPSHOT_SWAP_THRESHOLD_PERCENT=95
 SNAPSHOT_ETH0_THRESHOLD_PERCENT=95
-SNAPSHOT_ETH1_THRESHOLD_PERCENT=95
 SNAPSHOT_TEMPERATURE_THRESHOLD_C=80
 SNAPSHOT_LOG_RETENTION_DAYS=30
 ```
