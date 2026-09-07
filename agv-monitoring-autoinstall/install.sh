@@ -117,6 +117,21 @@ print(token)
 '
 }
 
+configure_remote_syslog() {
+    collector_host=$1
+    collector_port=$2
+    if ! command -v rsyslogd >/dev/null 2>&1; then
+        echo 'rsyslog is unavailable; remote kernel logging was not configured.' >&2
+        return
+    fi
+    install -d -m 0755 /etc/rsyslog.d
+    printf '%s\n' '# AGV Monitoring: duplicate local logs to the crash-evidence collector.' \
+        "*.* @${collector_host}:${collector_port};RSYSLOG_SyslogProtocol23Format" \
+        > /etc/rsyslog.d/60-agv-monitor-remote.conf
+    systemctl restart rsyslog
+    echo "Remote syslog enabled: UDP ${collector_host}:${collector_port}"
+}
+
 install -d -m 0750 /etc/agv-monitor /var/lib/agv-monitor /usr/local/lib/agv-monitor
 install -m 0755 telemetry_agent.py /usr/local/lib/agv-monitor/telemetry_agent.py
 install -m 0644 agv-monitor.service /etc/systemd/system/agv-monitor.service
@@ -172,6 +187,9 @@ if [ "${AGV_MONITOR_NONINTERACTIVE:-0}" = '1' ]; then
     chmod 0600 /etc/agv-monitor/telemetry.conf
     systemctl daemon-reload
     systemctl enable --now agv-monitor.service
+    collector_host=$(printf '%s\n' "$server_url" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
+    collector_port=$(printf '%s\n' "$server_url" | sed -nE 's#^[a-z]+://[^/:]+:([0-9]+).*#\1#p')
+    configure_remote_syslog "$collector_host" "${collector_port:-5001}"
     echo "Server registration completed for $device_name ($device_ip)."
     exit 0
 fi
