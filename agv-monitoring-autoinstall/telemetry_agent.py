@@ -4,7 +4,6 @@
 # This file deliberately uses only the Python standard library so it can run on
 # a Raspberry Pi without installing packages.
 
-import hashlib
 import json
 import logging
 import os
@@ -28,18 +27,17 @@ from urllib.request import Request, urlopen
 
 # All device-specific settings belong in the EnvironmentFile specified here.
 CONFIG_PATH = Path(os.environ.get("AGV_MONITOR_CONFIG", "/etc/agv-monitor/telemetry.conf"))
-AGENT_VERSION = "1.3.0"
+AGENT_VERSION = "1.2.0"
 DEFAULTS = {
     "SERVER_URL": "https://10.54.168.13:8085/api/v1/telemetry",
     "DEVICE_TOKEN": "",
     "SAMPLE_INTERVAL_SECONDS": "5",
     "INTERNAL_SAMPLE_INTERVAL_SECONDS": "0.5",
     "UPLOAD_INTERVAL_SECONDS": "300",
-    "UPLOAD_JITTER_SECONDS": "180",
     "DISK_PATH": "/",
     "SPOOL_PATH": "/var/lib/agv-monitor/telemetry-spool.jsonl",
     "MAX_SPOOL_SAMPLES": "120960",  # seven days at the five-second default
-    "HTTP_TIMEOUT_SECONDS": "90",
+    "HTTP_TIMEOUT_SECONDS": "20",
     "SNAPSHOT_CPU_THRESHOLD_PERCENT": "95",
     "SNAPSHOT_MEMORY_THRESHOLD_PERCENT": "95",
     "SNAPSHOT_STORAGE_THRESHOLD_PERCENT": "90",
@@ -883,20 +881,6 @@ def upload(config: dict[str, str]) -> bool:
     return True
 
 
-def upload_jitter_seconds(config: dict[str, str], upload_every: float) -> float:
-    """Spread fleet uploads predictably without changing each AGV's cadence."""
-    try:
-        jitter_window = max(0.0, float(config.get("UPLOAD_JITTER_SECONDS", "180")))
-    except ValueError:
-        jitter_window = 180.0
-    jitter_window = min(jitter_window, max(0.0, upload_every - 1.0))
-    if jitter_window == 0:
-        return 0.0
-    identity = f"{socket.gethostname()}:{config['DEVICE_TOKEN']}".encode()
-    fraction = int.from_bytes(hashlib.sha256(identity).digest()[:8], "big") / 2**64
-    return fraction * jitter_window
-
-
 def stop_handler(_signum: int, _frame: object) -> None:
     global STOP_REQUESTED
     STOP_REQUESTED = True
@@ -931,7 +915,7 @@ def main() -> int:
     next_sample = next_internal_sample + sample_every
     # CPU and network utilisation are rates. Wait for the first full telemetry
     # window before upload so the dashboard never receives a baseline 0/—.
-    next_upload = next_sample + upload_jitter_seconds(config, upload_every)
+    next_upload = next_sample
     while not STOP_REQUESTED:
         now = time.monotonic()
         if now >= next_midday_maintenance:
