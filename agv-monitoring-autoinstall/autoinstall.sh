@@ -72,7 +72,7 @@ sample_interval=5
 upload_interval=300
 disk_path=/
 max_spool_samples=120960
-http_timeout=20
+http_timeout=90
 
 while :; do
     show_configuration
