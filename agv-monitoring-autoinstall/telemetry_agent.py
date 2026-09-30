@@ -27,7 +27,7 @@ from urllib.request import Request, urlopen
 
 # All device-specific settings belong in the EnvironmentFile specified here.
 CONFIG_PATH = Path(os.environ.get("AGV_MONITOR_CONFIG", "/etc/agv-monitor/telemetry.conf"))
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.2.1"
 DEFAULTS = {
     "SERVER_URL": "https://10.54.168.13:8085/api/v1/telemetry",
     "DEVICE_TOKEN": "",
@@ -622,6 +622,73 @@ def storage_read_latency_ms(device_path: str) -> float | None:
         return None
 
 
+def pressure_status(resource: str) -> dict[str, object]:
+    """Return parsed kernel PSI, or a clear unsupported status on older kernels."""
+    path = Path(f"/proc/pressure/{resource}")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {"available": False, "reason": "kernel PSI is unavailable"}
+    result: dict[str, object] = {"available": True}
+    for line in lines:
+        parts = line.split()
+        if not parts:
+            continue
+        metrics: dict[str, float | int] = {}
+        for item in parts[1:]:
+            key, separator, value = item.partition("=")
+            if not separator:
+                continue
+            try:
+                metrics[key] = int(value) if key == "total" else float(value)
+            except ValueError:
+                continue
+        result[parts[0]] = metrics
+    return result
+
+
+def emmc_lifetime_range(value: int | None) -> str | None:
+    """Translate JEDEC EXT_CSD lifetime buckets into an operator-friendly range."""
+    if value is None or not 1 <= value <= 10:
+        return None
+    return f"{(value - 1) * 10}-{value * 10}%"
+
+
+def emmc_health() -> dict[str, object]:
+    """Read eMMC wear data using mmc-utils, with a kernel EXT_CSD fallback."""
+    keys = ("PRE_EOL_INFO", "DEVICE_LIFE_TIME_EST_TYP_A", "DEVICE_LIFE_TIME_EST_TYP_B")
+    extcsd = command_output(["mmc", "extcsd", "read", "/dev/mmcblk0"], line_limit=160)
+    values: dict[str, int | None] = {}
+    for key in keys:
+        match = re.search(rf"{key}[^0-9A-Fa-f]*(0x[0-9A-Fa-f]+|[0-9]+)", extcsd)
+        values[key] = int(match.group(1), 0) if match else None
+    source = "mmc-utils"
+    if not any(value is not None for value in values.values()):
+        source = "unavailable"
+        for path in sorted(Path("/sys/kernel/debug").glob("mmc*/mmc*:*/ext_csd")):
+            try:
+                data = bytes.fromhex(path.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                continue
+            if len(data) < 270:
+                continue
+            values = {
+                "PRE_EOL_INFO": data[267],
+                "DEVICE_LIFE_TIME_EST_TYP_A": data[268],
+                "DEVICE_LIFE_TIME_EST_TYP_B": data[269],
+            }
+            source = "kernel_debug_ext_csd"
+            break
+    pre_eol = values["PRE_EOL_INFO"]
+    return {
+        **{key: (f"0x{value:02x}" if value is not None else None) for key, value in values.items()},
+        "source": source,
+        "pre_eol_status": {1: "normal", 2: "warning", 3: "urgent"}.get(pre_eol, "unknown"),
+        "life_time_a_percent_range": emmc_lifetime_range(values["DEVICE_LIFE_TIME_EST_TYP_A"]),
+        "life_time_b_percent_range": emmc_lifetime_range(values["DEVICE_LIFE_TIME_EST_TYP_B"]),
+    }
+
+
 def system_health(config: dict[str, str]) -> dict[str, object]:
     """Collect cheap kernel/storage/I/O indicators for remote diagnosis."""
     blocked = []
@@ -637,20 +704,10 @@ def system_health(config: dict[str, str]) -> dict[str, object]:
     stat_fields = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()[1:]
     total_ticks = sum(int(value) for value in stat_fields)
     iowait_ticks = int(stat_fields[4]) if len(stat_fields) > 4 else 0
-    pressure = {}
-    for resource in ("cpu", "io", "memory"):
-        try:
-            pressure[resource] = Path(f"/proc/pressure/{resource}").read_text().strip().splitlines()
-        except OSError:
-            pressure[resource] = []
+    pressure = {resource: pressure_status(resource) for resource in ("cpu", "io", "memory")}
     if time.monotonic() - float(HEALTH_CACHE["updated_at"]) >= float(config["SYSTEM_HEALTH_INTERVAL_SECONDS"]):
-        extcsd = command_output(["mmc", "extcsd", "read", "/dev/mmcblk0"], line_limit=160)
         HEALTH_CACHE["slow"] = {
-            "emmc_health": {
-                key: (re.search(rf"{key}[^0-9A-Fa-f]*(0x[0-9A-Fa-f]+|[0-9]+)", extcsd).group(1)
-                      if re.search(rf"{key}[^0-9A-Fa-f]*(0x[0-9A-Fa-f]+|[0-9]+)", extcsd) else None)
-                for key in ("PRE_EOL_INFO", "DEVICE_LIFE_TIME_EST_TYP_A", "DEVICE_LIFE_TIME_EST_TYP_B")
-            },
+            "emmc_health": emmc_health(),
             "kernel_faults": command_output(
                 ["dmesg", "--level=err,warn,crit,alert,emerg"], line_limit=30
             ).splitlines()[-30:],
