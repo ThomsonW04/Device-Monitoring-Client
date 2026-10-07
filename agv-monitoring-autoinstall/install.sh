@@ -202,10 +202,10 @@ if [ ! -f /etc/agv-monitor/telemetry.conf ] || [ "${AGV_MONITOR_FORCE_REGISTER:-
     fi
     if prompt_yes_no 'Use HTTPS with the AGV Monitoring CA (recommended)' 'Y'; then
         install_ca_certificate
-        server_url=$(prompt_value 'Server telemetry URL' 'https://10.54.168.13:5001/api/v1/telemetry')
+        server_url=$(prompt_value 'Server telemetry URL' 'https://10.54.168.27:5001/api/v1/telemetry')
     else
         echo 'Warning: HTTP leaves device tokens and telemetry visible to the network.' >&2
-        server_url=$(prompt_value 'Server telemetry URL' 'http://10.54.168.13:8085/api/v1/telemetry')
+        server_url=$(prompt_value 'Server telemetry URL' 'http://10.54.168.27:8085/api/v1/telemetry')
     fi
     device_name=$(prompt_value 'Device name' "$(hostname)")
     device_ip=$(prompt_value 'Device IP address' '')

@@ -4,6 +4,7 @@
 # This file deliberately uses only the Python standard library so it can run on
 # a Raspberry Pi without installing packages.
 
+import hashlib
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from heapq import heappush, heapreplace
 import uuid
@@ -21,15 +23,15 @@ from datetime import datetime, timedelta, timezone
 from logging.handlers import SysLogHandler
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 
 # All device-specific settings belong in the EnvironmentFile specified here.
 CONFIG_PATH = Path(os.environ.get("AGV_MONITOR_CONFIG", "/etc/agv-monitor/telemetry.conf"))
-AGENT_VERSION = "1.2.1"
+AGENT_VERSION = "1.3.0"
 DEFAULTS = {
-    "SERVER_URL": "https://10.54.168.13:8085/api/v1/telemetry",
+    "SERVER_URL": "https://10.54.168.27:8085/api/v1/telemetry",
     "DEVICE_TOKEN": "",
     "SAMPLE_INTERVAL_SECONDS": "5",
     "INTERNAL_SAMPLE_INTERVAL_SECONDS": "0.5",
@@ -48,6 +50,9 @@ DEFAULTS = {
     "SNAPSHOT_LOG_RETENTION_DAYS": "30",
     "SYSTEM_HEALTH_INTERVAL_SECONDS": "30",
     "STORAGE_PROBE_DEVICE": "/dev/mmcblk0",
+    "AGENT_UPDATE_STATE_PATH": "/var/lib/agv-monitor/agent-update-state.json",
+    # This only stages boot-time crash capture.  It never reboots the vehicle.
+    "CRASH_CAPTURE_AUTO_ENABLE": "true",
 }
 MAX_BATCH_SIZE = 90  # The server API's explicit maximum.
 NETWORK_INTERFACES = ("eth0",)
@@ -533,6 +538,174 @@ def settings_url(server_url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, "/api/v1/device-settings", "", ""))
 
 
+def agent_update_url(server_url: str) -> str:
+    """Build the authenticated agent-update endpoint from the telemetry URL."""
+    parsed = urlsplit(server_url)
+    return urlunsplit((parsed.scheme, parsed.netloc, "/api/v1/agent-update", "", ""))
+
+
+def agent_update_status_url(server_url: str) -> str:
+    """Build the endpoint used to report installation outcomes."""
+    parsed = urlsplit(server_url)
+    return urlunsplit((parsed.scheme, parsed.netloc, "/api/v1/agent-update/status", "", ""))
+
+
+def agent_update_state_path(config: dict[str, str]) -> Path:
+    return Path(config["AGENT_UPDATE_STATE_PATH"])
+
+
+def update_status(config: dict[str, str], status: str, from_version: str,
+                  to_version: str, message: str, log: str = "") -> None:
+    """Report a bounded, redacted update result without interrupting telemetry."""
+    payload = {
+        "status": status,
+        "from_version": from_version,
+        "to_version": to_version,
+        "message": message[:500],
+        "log": redact_sensitive_values(log)[-64_000:] or None,
+    }
+    request = Request(
+        agent_update_status_url(config["SERVER_URL"]),
+        json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": "Bearer " + config["DEVICE_TOKEN"], "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=float(config["HTTP_TIMEOUT_SECONDS"])) as response:
+            if response.status != 202:
+                raise OSError(f"unexpected HTTP status {response.status}")
+    except (HTTPError, URLError, OSError) as error:
+        LOG.warning("Unable to report agent update outcome: %s", error)
+
+
+def write_update_state(path: Path, state: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                     prefix=path.name + ".", delete=False) as temporary:
+        json.dump(state, temporary, sort_keys=True)
+        temporary.flush()
+        os.fsync(temporary.fileno())
+    Path(temporary.name).replace(path)
+
+
+def complete_pending_update(config: dict[str, str]) -> None:
+    """Confirm a replacement only after the new code loaded its real config."""
+    state_path = agent_update_state_path(config)
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if state.get("to_version") != AGENT_VERSION:
+        return
+    update_status(
+        config, "installed", state.get("from_version", "unknown"), AGENT_VERSION,
+        "Downloaded agent passed validation and started successfully.",
+    )
+    try:
+        state_path.unlink()
+    except OSError as error:
+        LOG.warning("Unable to clear completed agent-update state: %s", error)
+
+
+def same_server_origin(server_url: str, candidate_url: str) -> bool:
+    expected, candidate = urlsplit(server_url), urlsplit(candidate_url)
+    return expected.scheme == candidate.scheme and expected.netloc == candidate.netloc
+
+
+def check_for_agent_update(config: dict[str, str]) -> bool:
+    """Fetch and atomically start a newer server-published agent, if available."""
+    check_url = agent_update_url(config["SERVER_URL"])
+    check_url = check_url + "?" + urlencode({"current_version": AGENT_VERSION})
+    request = Request(check_url, headers={"Authorization": "Bearer " + config["DEVICE_TOKEN"]})
+    try:
+        with urlopen(request, timeout=float(config["HTTP_TIMEOUT_SECONDS"])) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, OSError, json.JSONDecodeError) as error:
+        LOG.warning("Unable to check for telemetry-agent update: %s", error)
+        return False
+    if not isinstance(payload, dict) or not payload.get("update_available"):
+        return False
+    payload["available"] = True
+    return install_agent_update(config, payload)
+
+
+def install_agent_update(config: dict[str, str], payload: dict[str, object]) -> bool:
+    """Atomically start the agent advertised in a telemetry acknowledgement."""
+    if not payload.get("available"):
+        return False
+
+    target_version = payload.get("latest_version")
+    expected_sha256 = payload.get("sha256")
+    download_url = payload.get("download_url")
+    if not all(isinstance(value, str) and value for value in (target_version, expected_sha256, download_url)):
+        error = "Server returned incomplete agent-update metadata"
+        LOG.error(error)
+        update_status(config, "failed", AGENT_VERSION, str(target_version or "unknown"), error)
+        return False
+    if not same_server_origin(config["SERVER_URL"], download_url):
+        error = "Server returned an agent download URL outside the configured server origin"
+        LOG.error(error)
+        update_status(config, "failed", AGENT_VERSION, target_version, error)
+        return False
+
+    script_path: Path | None = None
+    backup_path: Path | None = None
+    replacement_installed = False
+    try:
+        download_request = Request(download_url, headers={"Authorization": "Bearer " + config["DEVICE_TOKEN"]})
+        with urlopen(download_request, timeout=float(config["HTTP_TIMEOUT_SECONDS"])) as response:
+            content = response.read()
+        if hashlib.sha256(content).hexdigest() != expected_sha256.lower():
+            raise ValueError("download SHA-256 does not match the server response")
+        text = content.decode("utf-8")
+        version_match = re.search(r'^AGENT_VERSION\s*=\s*["\']([^"\']+)["\']\s*$', text, re.MULTILINE)
+        if version_match is None or version_match.group(1) != target_version:
+            raise ValueError("downloaded agent version does not match the server response")
+        script_path = Path(__file__).resolve()
+        with tempfile.NamedTemporaryFile("wb", dir=script_path.parent, prefix=script_path.name + ".",
+                                         suffix=".new", delete=False) as temporary:
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        candidate_path = Path(temporary.name)
+        try:
+            result = subprocess.run(
+                [sys.executable, str(candidate_path), "--self-test"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            if result.returncode != 0:
+                raise ValueError("agent self-test failed: " + (result.stderr or result.stdout)[-4_000:])
+            backup_path = script_path.with_name(script_path.name + ".previous")
+            backup_path.write_bytes(script_path.read_bytes())
+            os.chmod(backup_path, stat.S_IMODE(script_path.stat().st_mode))
+            write_update_state(agent_update_state_path(config), {
+                "from_version": AGENT_VERSION,
+                "to_version": target_version,
+                "backup_path": str(backup_path),
+            })
+            os.chmod(candidate_path, stat.S_IMODE(script_path.stat().st_mode))
+            candidate_path.replace(script_path)
+            replacement_installed = True
+        finally:
+            if "candidate_path" in locals() and candidate_path.exists():
+                candidate_path.unlink()
+        LOG.info("Installed telemetry agent %s; restarting the agent process", target_version)
+        os.execv(sys.executable, [sys.executable, str(script_path)])
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        LOG.exception("Unable to install telemetry-agent %s: %s", target_version, error)
+        if replacement_installed and script_path and backup_path and backup_path.exists():
+            try:
+                backup_path.replace(script_path)
+                agent_update_state_path(config).unlink(missing_ok=True)
+                update_status(config, "rolled_back", AGENT_VERSION, target_version,
+                              "Agent restart failed; restored the previous agent.", repr(error))
+                return False
+            except OSError as rollback_error:
+                error = OSError(f"{error}; rollback also failed: {rollback_error}")
+        update_status(config, "failed", AGENT_VERSION, target_version, str(error), repr(error))
+    return False
+
+
 def synchronise_snapshot_settings(config: dict[str, str]) -> None:
     """Fetch the globally managed snapshot settings without overwriting local config files."""
     request = Request(
@@ -555,6 +728,27 @@ def synchronise_snapshot_settings(config: dict[str, str]) -> None:
         if key.startswith("SNAPSHOT_") and key in settings:
             config[key] = str(settings[key])
     LOG.info("Synchronised global snapshot settings from the server")
+
+
+def apply_server_directives(config: dict[str, str], payload: dict[str, object]) -> None:
+    """Apply every safe directive in one acknowledgement before handling an update.
+
+    A successful upload is the single configuration channel.  Settings are kept
+    in memory for the running agent, while boot-time crash capture is staged on
+    disk and deliberately waits for an operator-planned reboot.
+    """
+    directives = payload.get("directives")
+    if not isinstance(directives, dict):
+        return
+    settings = directives.get("snapshot_settings")
+    if isinstance(settings, dict):
+        for key in DEFAULTS:
+            if key.startswith("SNAPSHOT_") and key in settings:
+                config[key] = str(settings[key])
+        LOG.info("Applied global snapshot settings revision %s", directives.get("revision", "unknown"))
+    crash_capture = directives.get("crash_capture")
+    if isinstance(crash_capture, dict) and enabled_setting(crash_capture.get("enabled")):
+        enable_crash_capture()
 
 
 def seconds_until_next_midday() -> float:
@@ -689,6 +883,147 @@ def emmc_health() -> dict[str, object]:
     }
 
 
+CRASH_CAPTURE_FILES = {
+    Path("/etc/systemd/journald.conf.d/95-agv-crash-capture.conf"): "[Journal]\nStorage=persistent\n",
+    Path("/etc/sysctl.d/95-agv-crash-capture.conf"): (
+        "kernel.hung_task_panic=1\n"
+        "kernel.hung_task_timeout_secs=180\n"
+        "kernel.panic_on_oops=1\n"
+        "kernel.panic=30\n"
+    ),
+    Path("/etc/systemd/system.conf.d/95-agv-watchdog.conf"): (
+        "[Manager]\nRuntimeWatchdogSec=30s\nRebootWatchdogSec=10min\n"
+    ),
+}
+RAMOOPS_OVERLAY = "dtoverlay=ramoops,total-size=262144,record-size=65536,console-size=65536"
+
+
+def enabled_setting(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def write_root_configuration(path: Path, content: str) -> None:
+    """Write a small root-owned configuration file atomically; never restart a service."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".agv-monitor-new")
+    temporary.write_text(content, encoding="utf-8")
+    os.chmod(temporary, 0o644)
+    temporary.replace(path)
+
+
+def stage_crash_capture_via_systemd() -> bool:
+    """Bypass this service's read-only mount namespace without restarting anything.
+
+    Older agent units protect /etc and /boot.  systemd starts this fixed,
+    local one-shot command in the manager namespace, so existing installations
+    can still stage the same audited files.  No server supplied shell content
+    is executed here.
+    """
+    script = Path("/run/agv-monitor-stage-crash-capture.sh")
+    content = f"""#!/bin/sh
+set -eu
+install -d -m 0755 /etc/systemd/journald.conf.d /etc/systemd/system.conf.d /etc/sysctl.d
+printf '%s\\n' '[Journal]' 'Storage=persistent' > /etc/systemd/journald.conf.d/95-agv-crash-capture.conf
+printf '%s\\n' 'kernel.hung_task_panic=1' 'kernel.hung_task_timeout_secs=180' 'kernel.panic_on_oops=1' 'kernel.panic=30' > /etc/sysctl.d/95-agv-crash-capture.conf
+printf '%s\\n' '[Manager]' 'RuntimeWatchdogSec=30s' 'RebootWatchdogSec=10min' > /etc/systemd/system.conf.d/95-agv-watchdog.conf
+test ! -e /etc/systemd/journald.conf.d/70-storage-volatile.conf || mv /etc/systemd/journald.conf.d/70-storage-volatile.conf /etc/systemd/journald.conf.d/70-storage-volatile.conf.disabled
+grep -qxF '{RAMOOPS_OVERLAY}' /boot/firmware/config.txt || printf '%s\\n' '{RAMOOPS_OVERLAY}' >> /boot/firmware/config.txt
+grep -qw 'psi=1' /boot/firmware/cmdline.txt || printf ' psi=1\\n' >> /boot/firmware/cmdline.txt
+"""
+    try:
+        script.write_text(content, encoding="utf-8")
+        os.chmod(script, 0o700)
+        completed = subprocess.run(
+            ["systemd-run", "--quiet", "--wait", "--collect", "--service-type=oneshot", "/bin/sh", str(script)],
+            capture_output=True, text=True, timeout=45, check=False,
+        )
+        if completed.returncode:
+            LOG.warning("systemd crash-capture staging failed: %s", (completed.stderr or completed.stdout).strip())
+            return False
+        LOG.warning("Staged crash capture through systemd for the next reboot")
+        return True
+    except (OSError, subprocess.SubprocessError) as error:
+        LOG.warning("Unable to use systemd crash-capture staging fallback: %s", error)
+        return False
+    finally:
+        try:
+            script.unlink()
+        except OSError:
+            pass
+
+
+def enable_crash_capture() -> list[str]:
+    """Stage persistent crash capture for the next boot without rebooting the AGV."""
+    changed: list[str] = []
+    for path, content in CRASH_CAPTURE_FILES.items():
+        try:
+            if path.read_text(encoding="utf-8") != content:
+                write_root_configuration(path, content)
+                changed.append(str(path))
+        except OSError as error:
+            LOG.warning("Unable to stage crash-capture setting %s: %s", path, error)
+    volatile_override = Path("/etc/systemd/journald.conf.d/70-storage-volatile.conf")
+    if volatile_override.exists():
+        try:
+            volatile_override.rename(volatile_override.with_name(volatile_override.name + ".disabled"))
+            changed.append(str(volatile_override))
+        except OSError as error:
+            LOG.warning("Unable to disable volatile journal override: %s", error)
+    boot_config = Path("/boot/firmware/config.txt")
+    try:
+        content = boot_config.read_text(encoding="utf-8")
+        if RAMOOPS_OVERLAY not in content:
+            boot_config.write_text(content.rstrip() + "\n" + RAMOOPS_OVERLAY + "\n", encoding="utf-8")
+            changed.append(str(boot_config))
+    except OSError as error:
+        LOG.warning("Unable to stage ramoops overlay: %s", error)
+    command_line = Path("/boot/firmware/cmdline.txt")
+    try:
+        content = command_line.read_text(encoding="utf-8").strip()
+        if "psi=1" not in content.split():
+            command_line.write_text(content + " psi=1\n", encoding="utf-8")
+            changed.append(str(command_line))
+    except OSError as error:
+        LOG.warning("Unable to stage PSI boot option: %s", error)
+    required = tuple(CRASH_CAPTURE_FILES) + (Path("/boot/firmware/config.txt"), Path("/boot/firmware/cmdline.txt"))
+    if not all(path.exists() and os.access(path, os.W_OK) for path in required):
+        stage_crash_capture_via_systemd()
+    if changed:
+        LOG.warning("Staged crash capture for the next reboot: %s", ", ".join(changed))
+    return changed
+
+
+def crash_capture_status() -> dict[str, object]:
+    """Report configured and live crash-capture state plus bounded pstore evidence."""
+    expected_files = {str(path): path.exists() and path.read_text(encoding="utf-8", errors="replace") == content
+                      for path, content in CRASH_CAPTURE_FILES.items()}
+    boot_config = file_contents(Path("/boot/firmware/config.txt"), line_limit=400)
+    cmdline = file_contents(Path("/proc/cmdline"), line_limit=1)
+    pstore_records: list[dict[str, str]] = []
+    for record in sorted(Path("/sys/fs/pstore").glob("*"))[:20]:
+        if not record.is_file():
+            continue
+        try:
+            pstore_records.append({"name": record.name, "content": redact_sensitive_values(record.read_text(encoding="utf-8", errors="replace")[:8_000])})
+        except OSError:
+            continue
+    ramoops_active = any("ramoops" in line.lower() for line in command_output(["dmesg"], line_limit=400).splitlines())
+    configured = all(expected_files.values()) and RAMOOPS_OVERLAY in boot_config and "psi=1" in cmdline.split()
+    return {
+        "configured": configured,
+        "reboot_required": configured and (not Path("/proc/pressure/cpu").exists() or not ramoops_active),
+        "persistent_journal_configured": expected_files[str(Path("/etc/systemd/journald.conf.d/95-agv-crash-capture.conf"))],
+        "ramoops_configured": RAMOOPS_OVERLAY in boot_config,
+        "ramoops_active": ramoops_active,
+        "psi_configured": "psi=1" in cmdline.split(),
+        "psi_active": Path("/proc/pressure/cpu").exists(),
+        "panic_policy_configured": expected_files[str(Path("/etc/sysctl.d/95-agv-crash-capture.conf"))],
+        "watchdog_configured": expected_files[str(Path("/etc/systemd/system.conf.d/95-agv-watchdog.conf"))],
+        "pstore_records": pstore_records,
+        "kernel_panic_detected": bool(pstore_records),
+    }
+
+
 def system_health(config: dict[str, str]) -> dict[str, object]:
     """Collect cheap kernel/storage/I/O indicators for remote diagnosis."""
     blocked = []
@@ -715,6 +1050,7 @@ def system_health(config: dict[str, str]) -> dict[str, object]:
             "storage_read_latency_ms": storage_read_latency_ms(config["STORAGE_PROBE_DEVICE"]),
             "boot_id": file_contents(Path("/proc/sys/kernel/random/boot_id"), line_limit=1).strip(),
             "previous_boot_kernel": command_output(["journalctl", "-b", "-1", "-k", "-n", "30"], line_limit=30).splitlines(),
+            "crash_capture": crash_capture_status(),
         }
         HEALTH_CACHE["updated_at"] = time.monotonic()
     return {
@@ -927,8 +1263,17 @@ def upload(config: dict[str, str]) -> bool:
             with urlopen(request, timeout=float(config["HTTP_TIMEOUT_SECONDS"])) as response:
                 if response.status != 202:
                     raise OSError(f"unexpected HTTP status {response.status}")
+                response_payload = json.loads(response.read().decode("utf-8") or "{}")
             remove_sent_samples(spool_path, len(samples))
             LOG.info("Uploaded %s telemetry samples", len(samples))
+            update_directive = response_payload.get("agent_update", {})
+            apply_server_directives(config, response_payload)
+            if isinstance(update_directive, dict) and update_directive.get("available"):
+                LOG.info(
+                    "Server reports telemetry-agent %s is available; checking update now",
+                    update_directive.get("latest_version", "newer"),
+                )
+                install_agent_update(config, update_directive)
         except HTTPError as error:
             LOG.error("Telemetry upload rejected: HTTP %s", error.code)
             return False
@@ -945,7 +1290,9 @@ def stop_handler(_signum: int, _frame: object) -> None:
 
 def main() -> int:
     config = load_config()
-    synchronise_snapshot_settings(config)
+    complete_pending_update(config)
+    if enabled_setting(config["CRASH_CAPTURE_AUTO_ENABLE"]):
+        enable_crash_capture()
     sample_every = float(config["SAMPLE_INTERVAL_SECONDS"])
     internal_sample_every = float(config["INTERNAL_SAMPLE_INTERVAL_SECONDS"])
     if internal_sample_every > sample_every:
@@ -967,7 +1314,6 @@ def main() -> int:
     thresholds = snapshot_thresholds(config)
     retention_days = int(config["SNAPSHOT_LOG_RETENTION_DAYS"])
     cleanup_snapshot_logs(retention_days)
-    next_midday_maintenance = time.monotonic() + seconds_until_next_midday()
     next_internal_sample = time.monotonic()
     next_sample = next_internal_sample + sample_every
     # CPU and network utilisation are rates. Wait for the first full telemetry
@@ -975,13 +1321,6 @@ def main() -> int:
     next_upload = next_sample
     while not STOP_REQUESTED:
         now = time.monotonic()
-        if now >= next_midday_maintenance:
-            synchronise_snapshot_settings(config)
-            thresholds = snapshot_thresholds(config)
-            retention_days = int(config["SNAPSHOT_LOG_RETENTION_DAYS"])
-            cleanup_snapshot_logs(retention_days)
-            active_high_metrics = set()
-            next_midday_maintenance = time.monotonic() + seconds_until_next_midday()
         if now >= next_internal_sample:
             try:
                 (
@@ -1064,6 +1403,8 @@ def main() -> int:
                 next_internal_sample = now + internal_sample_every
         if now >= next_upload:
             upload(config)
+            thresholds = snapshot_thresholds(config)
+            retention_days = int(config["SNAPSHOT_LOG_RETENTION_DAYS"])
             next_upload += upload_every
             if next_upload <= now:
                 next_upload = now + upload_every
@@ -1078,6 +1419,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        try:
+            load_config()
+            print(f"telemetry-agent {AGENT_VERSION} self-test passed")
+            raise SystemExit(0)
+        except (OSError, ValueError) as error:
+            print(f"telemetry-agent self-test failed: {error}", file=sys.stderr)
+            raise SystemExit(2)
     try:
         raise SystemExit(main())
     except ValueError as error:

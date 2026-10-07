@@ -1,6 +1,6 @@
 #!/bin/sh
 # Run as root on a RevPi after deploying the monitoring agent.
-# Usage: ./configure_remote_syslog.sh 10.54.168.13 [5001]
+# Usage: ./configure_remote_syslog.sh 10.54.168.27 [5001]
 set -eu
 
 collector_host=${1:?usage: configure_remote_syslog.sh COLLECTOR_HOST [PORT]}

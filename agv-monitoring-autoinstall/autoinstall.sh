@@ -65,7 +65,7 @@ edit_configuration() {
 
 admin_username=$(secret_value ADMIN_USERNAME_B64)
 admin_password=$(secret_value ADMIN_PASSWORD_B64)
-server_url='https://10.54.168.13:5001/api/v1/telemetry'
+server_url='https://10.54.168.27:5001/api/v1/telemetry'
 device_name=$(derive_device_name)
 device_ip=$(derive_device_ip "$device_name" || true)
 sample_interval=5
