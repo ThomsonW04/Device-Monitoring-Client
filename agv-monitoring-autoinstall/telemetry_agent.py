@@ -895,7 +895,7 @@ CRASH_CAPTURE_FILES = {
         "[Manager]\nRuntimeWatchdogSec=30s\nRebootWatchdogSec=10min\n"
     ),
 }
-RAMOOPS_OVERLAY = "dtoverlay=ramoops,total-size=262144,record-size=65536,console-size=65536"
+RAMOOPS_OVERLAY = "dtoverlay=ramoops,total-size=1048576,record-size=262144,console-size=262144"
 
 
 def enabled_setting(value: object) -> bool:
@@ -972,8 +972,13 @@ def enable_crash_capture() -> list[str]:
     boot_config = Path("/boot/firmware/config.txt")
     try:
         content = boot_config.read_text(encoding="utf-8")
-        if RAMOOPS_OVERLAY not in content:
-            boot_config.write_text(content.rstrip() + "\n" + RAMOOPS_OVERLAY + "\n", encoding="utf-8")
+        # Keep exactly one ramoops overlay.  Older agent releases used a
+        # smaller reservation; leaving both lines makes the final (old) line
+        # override the intended capture size at boot.
+        retained_lines = [line for line in content.splitlines() if not line.startswith("dtoverlay=ramoops,")]
+        desired_content = "\n".join(retained_lines).rstrip() + "\n" + RAMOOPS_OVERLAY + "\n"
+        if content != desired_content:
+            boot_config.write_text(desired_content, encoding="utf-8")
             changed.append(str(boot_config))
     except OSError as error:
         LOG.warning("Unable to stage ramoops overlay: %s", error)
