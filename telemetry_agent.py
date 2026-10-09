@@ -29,7 +29,7 @@ from urllib.request import Request, urlopen
 
 # All device-specific settings belong in the EnvironmentFile specified here.
 CONFIG_PATH = Path(os.environ.get("AGV_MONITOR_CONFIG", "/etc/agv-monitor/telemetry.conf"))
-AGENT_VERSION = "1.3.1"
+AGENT_VERSION = "1.3.2"
 DEFAULTS = {
     "SERVER_URL": "https://10.54.168.27:8085/api/v1/telemetry",
     "DEVICE_TOKEN": "",
@@ -892,7 +892,7 @@ CRASH_CAPTURE_FILES = {
         "kernel.panic=30\n"
     ),
     Path("/etc/systemd/system.conf.d/95-agv-watchdog.conf"): (
-        "[Manager]\nRuntimeWatchdogSec=30s\nRebootWatchdogSec=10min\n"
+        "[Manager]\nRuntimeWatchdogSec=45s\nRebootWatchdogSec=10min\n"
     ),
 }
 RAMOOPS_OVERLAY = "dtoverlay=ramoops,total-size=1048576,record-size=262144,console-size=262144"
@@ -925,7 +925,7 @@ set -eu
 install -d -m 0755 /etc/systemd/journald.conf.d /etc/systemd/system.conf.d /etc/sysctl.d
 printf '%s\\n' '[Journal]' 'Storage=persistent' > /etc/systemd/journald.conf.d/95-agv-crash-capture.conf
 printf '%s\\n' 'kernel.hung_task_panic=1' 'kernel.hung_task_timeout_secs=180' 'kernel.panic_on_oops=1' 'kernel.panic=30' > /etc/sysctl.d/95-agv-crash-capture.conf
-printf '%s\\n' '[Manager]' 'RuntimeWatchdogSec=30s' 'RebootWatchdogSec=10min' > /etc/systemd/system.conf.d/95-agv-watchdog.conf
+printf '%s\\n' '[Manager]' 'RuntimeWatchdogSec=45s' 'RebootWatchdogSec=10min' > /etc/systemd/system.conf.d/95-agv-watchdog.conf
 test ! -e /etc/systemd/journald.conf.d/70-storage-volatile.conf || mv /etc/systemd/journald.conf.d/70-storage-volatile.conf /etc/systemd/journald.conf.d/70-storage-volatile.conf.disabled
 grep -qxF '{RAMOOPS_OVERLAY}' /boot/firmware/config.txt || printf '%s\\n' '{RAMOOPS_OVERLAY}' >> /boot/firmware/config.txt
 grep -qw 'psi=1' /boot/firmware/cmdline.txt || printf ' psi=1\\n' >> /boot/firmware/cmdline.txt
