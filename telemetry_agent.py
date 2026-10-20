@@ -29,7 +29,7 @@ from urllib.request import Request, urlopen
 
 # All device-specific settings belong in the EnvironmentFile specified here.
 CONFIG_PATH = Path(os.environ.get("AGV_MONITOR_CONFIG", "/etc/agv-monitor/telemetry.conf"))
-AGENT_VERSION = "1.3.2"
+AGENT_VERSION = "1.4.0"
 DEFAULTS = {
     "SERVER_URL": "https://10.54.168.27:8085/api/v1/telemetry",
     "DEVICE_TOKEN": "",
@@ -49,6 +49,9 @@ DEFAULTS = {
     "SNAPSHOT_TEMPERATURE_THRESHOLD_C": "80",
     "SNAPSHOT_LOG_RETENTION_DAYS": "30",
     "SYSTEM_HEALTH_INTERVAL_SECONDS": "30",
+    "BATTERY_STATUS_INTERVAL_SECONDS": "5",
+    "HACO_READ_ONLY_HOST": "127.0.0.1",
+    "HACO_READ_ONLY_PORT": "2015",
     "STORAGE_PROBE_DEVICE": "/dev/mmcblk0",
     "AGENT_UPDATE_STATE_PATH": "/var/lib/agv-monitor/agent-update-state.json",
     # This only stages boot-time crash capture.  It never reboots the vehicle.
@@ -60,6 +63,7 @@ STOP_REQUESTED = False
 SNAPSHOT_LOG_DIRECTORY = Path("/var/log")
 SNAPSHOT_LOG_PREFIX = "AGV-Monitor-"
 HEALTH_CACHE: dict[str, object] = {"updated_at": 0.0, "slow": {}}
+BATTERY_CACHE: dict[str, object] = {"updated_at": 0.0, "value": {"available": False, "age_seconds": None}}
 SNAPSHOT_METRICS = {
     "CPU": ("cpu_percent", "SNAPSHOT_CPU_THRESHOLD_PERCENT"),
     "RAM": ("memory_percent", "SNAPSHOT_MEMORY_THRESHOLD_PERCENT"),
@@ -137,12 +141,14 @@ def load_config() -> dict[str, str]:
     for key in (
         "SAMPLE_INTERVAL_SECONDS", "INTERNAL_SAMPLE_INTERVAL_SECONDS",
         "UPLOAD_INTERVAL_SECONDS", "HTTP_TIMEOUT_SECONDS",
-        "SYSTEM_HEALTH_INTERVAL_SECONDS",
+        "SYSTEM_HEALTH_INTERVAL_SECONDS", "BATTERY_STATUS_INTERVAL_SECONDS",
     ):
         if float(config[key]) <= 0:
             raise ValueError(f"{key} must be greater than zero")
     if int(config["MAX_SPOOL_SAMPLES"]) <= 0:
         raise ValueError("MAX_SPOOL_SAMPLES must be greater than zero")
+    if not 1 <= int(config["HACO_READ_ONLY_PORT"]) <= 65535:
+        raise ValueError("HACO_READ_ONLY_PORT must be a valid TCP port")
     if int(config["SNAPSHOT_LOG_RETENTION_DAYS"]) <= 0:
         raise ValueError("SNAPSHOT_LOG_RETENTION_DAYS must be greater than zero")
     for _label, (_metric, threshold_key) in SNAPSHOT_METRICS.items():
@@ -482,7 +488,11 @@ def collect(
         "load_1m": load,
         "eth0_percent": network["eth0"],
         "eth0_link_up": link_up["eth0"],
-        "extra": {"agent_version": AGENT_VERSION, "system_health": system_health(config)},
+        "extra": {
+            "agent_version": AGENT_VERSION,
+            "battery_status": battery_status(config),
+            "system_health": system_health(config),
+        },
     }, current_cpu, current_processes, current_network, current_disk_io, process_cpu, accounted_cpu
 
 
@@ -1027,6 +1037,66 @@ def crash_capture_status() -> dict[str, object]:
         "pstore_records": pstore_records,
         "kernel_panic_detected": bool(pstore_records),
     }
+
+
+def haco_battery_event(config: dict[str, str]) -> dict[str, object] | None:
+    """Read one BMS event from HACO's documented local read-only endpoint."""
+    request = {
+        "command_id": "agv-monitor-battery",
+        "command_type": "command_request_events",
+        "command_request_events": {
+            "requested_events": ["event_battery_status"],
+            "trigger": "single",
+        }
+    }
+    try:
+        with socket.create_connection(
+            (config["HACO_READ_ONLY_HOST"], int(config["HACO_READ_ONLY_PORT"])), timeout=1.0
+        ) as connection:
+            connection.settimeout(1.0)
+            connection.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
+            decoder, buffer = json.JSONDecoder(), ""
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                buffer += connection.recv(4096).decode("utf-8", errors="replace")
+                while buffer.lstrip():
+                    buffer = buffer.lstrip()
+                    try:
+                        message, position = decoder.raw_decode(buffer)
+                    except json.JSONDecodeError:
+                        break
+                    buffer = buffer[position:]
+                    event = message.get("event_battery_status") if isinstance(message, dict) else None
+                    if isinstance(event, dict):
+                        return event
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        LOG.debug("Unable to read HACO battery status: %s", error)
+    return None
+
+
+def battery_status(config: dict[str, str]) -> dict[str, object]:
+    """Return a bounded, non-blocking BMS status cache for every upload."""
+    now = time.monotonic()
+    interval = max(1.0, float(config["BATTERY_STATUS_INTERVAL_SECONDS"]))
+    if now - float(BATTERY_CACHE["updated_at"]) >= interval:
+        event = haco_battery_event(config)
+        previous = BATTERY_CACHE.get("value", {})
+        if event:
+            BATTERY_CACHE["value"] = {
+                "available": True,
+                "state_of_charge_pct": event.get("state_of_charge"),
+                "voltage_v": event.get("voltage"),
+                "current_a": event.get("current"),
+                "temperature_c": event.get("temperature"),
+                "state_of_health_pct": event.get("state_of_health"),
+                "errors": event.get("errors", []),
+            }
+        else:
+            BATTERY_CACHE["value"] = {**previous, "available": False}
+        BATTERY_CACHE["updated_at"] = now
+    value = dict(BATTERY_CACHE["value"])
+    value["age_seconds"] = round(now - float(BATTERY_CACHE["updated_at"]), 2)
+    return value
 
 
 def system_health(config: dict[str, str]) -> dict[str, object]:
