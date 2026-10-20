@@ -57,6 +57,7 @@ DEFAULTS = {
     "CRASH_CAPTURE_AUTO_ENABLE": "true",
 }
 MAX_BATCH_SIZE = 90  # The server API's explicit maximum.
+MAX_UPLOAD_BYTES = 900_000  # Leave headroom beneath the server's request limit.
 NETWORK_INTERFACES = ("eth0",)
 STOP_REQUESTED = False
 SNAPSHOT_LOG_DIRECTORY = Path("/var/log")
@@ -1041,12 +1042,12 @@ def bms_state_of_charge(config: dict[str, str]) -> float | None:
     try:
         process = subprocess.Popen(
             [config["SLDDE_DUMP_PATH"], "--topic-id", "storage", "--topic-type", "sldde::msg::sensors::BmsState"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True,
         )
         try:
             output, _ = process.communicate(timeout=1.5)
         except subprocess.TimeoutExpired as error:
-            process.kill()
+            os.killpg(process.pid, signal.SIGKILL)
             output, _ = process.communicate()
             output = (error.output or "") + (output or "")
         match = re.search(r"stateOfCharge:\s*(-?\d+(?:\.\d+)?)", output or "")
@@ -1306,7 +1307,13 @@ def write_snapshot(
 
 def upload(config: dict[str, str]) -> bool:
     spool_path = Path(config["SPOOL_PATH"])
-    while samples := pending_samples(spool_path)[:MAX_BATCH_SIZE]:
+    while queued := pending_samples(spool_path):
+        samples: list[dict] = []
+        for sample in queued[:MAX_BATCH_SIZE]:
+            candidate = samples + [sample]
+            if samples and len(json.dumps({"batch_id": str(uuid.uuid4()), "samples": candidate}).encode()) > MAX_UPLOAD_BYTES:
+                break
+            samples = candidate
         payload = json.dumps({"batch_id": str(uuid.uuid4()), "samples": samples}).encode()
         request = Request(
             config["SERVER_URL"], payload,
@@ -1329,6 +1336,17 @@ def upload(config: dict[str, str]) -> bool:
                 )
                 install_agent_update(config, update_directive)
         except HTTPError as error:
+            if error.code == 413 and len(samples) > 1:
+                LOG.warning("Telemetry batch exceeded server limit; retrying with one sample")
+                payload = json.dumps({"batch_id": str(uuid.uuid4()), "samples": [samples[0]]}).encode()
+                request = Request(config["SERVER_URL"], payload, headers={"Authorization": "Bearer " + config["DEVICE_TOKEN"], "Content-Type": "application/json"}, method="POST")
+                try:
+                    with urlopen(request, timeout=float(config["HTTP_TIMEOUT_SECONDS"])) as response:
+                        if response.status != 202: raise OSError(f"unexpected HTTP status {response.status}")
+                    remove_sent_samples(spool_path, 1)
+                    continue
+                except (HTTPError, URLError, OSError):
+                    pass
             LOG.error("Telemetry upload rejected: HTTP %s", error.code)
             return False
         except (URLError, OSError) as error:
