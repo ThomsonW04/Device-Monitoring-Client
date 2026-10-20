@@ -29,7 +29,7 @@ from urllib.request import Request, urlopen
 
 # All device-specific settings belong in the EnvironmentFile specified here.
 CONFIG_PATH = Path(os.environ.get("AGV_MONITOR_CONFIG", "/etc/agv-monitor/telemetry.conf"))
-AGENT_VERSION = "1.4.1"
+AGENT_VERSION = "1.4.2"
 DEFAULTS = {
     "SERVER_URL": "https://10.54.168.27:5001/api/v1/telemetry",
     "DEVICE_TOKEN": "",
@@ -1046,10 +1046,9 @@ def bms_state_of_charge(config: dict[str, str]) -> float | None:
         )
         try:
             output, _ = process.communicate(timeout=1.5)
-        except subprocess.TimeoutExpired as error:
+        except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             output, _ = process.communicate()
-            output = (error.output or "") + (output or "")
         match = re.search(r"stateOfCharge:\s*(-?\d+(?:\.\d+)?)", output or "")
         if match:
             value = float(match.group(1))
