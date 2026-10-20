@@ -29,9 +29,9 @@ from urllib.request import Request, urlopen
 
 # All device-specific settings belong in the EnvironmentFile specified here.
 CONFIG_PATH = Path(os.environ.get("AGV_MONITOR_CONFIG", "/etc/agv-monitor/telemetry.conf"))
-AGENT_VERSION = "1.4.0"
+AGENT_VERSION = "1.4.1"
 DEFAULTS = {
-    "SERVER_URL": "https://10.54.168.27:8085/api/v1/telemetry",
+    "SERVER_URL": "https://10.54.168.27:5001/api/v1/telemetry",
     "DEVICE_TOKEN": "",
     "SAMPLE_INTERVAL_SECONDS": "5",
     "INTERNAL_SAMPLE_INTERVAL_SECONDS": "0.5",
