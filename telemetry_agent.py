@@ -50,8 +50,7 @@ DEFAULTS = {
     "SNAPSHOT_LOG_RETENTION_DAYS": "30",
     "SYSTEM_HEALTH_INTERVAL_SECONDS": "30",
     "BATTERY_STATUS_INTERVAL_SECONDS": "5",
-    "HACO_READ_ONLY_HOST": "127.0.0.1",
-    "HACO_READ_ONLY_PORT": "2015",
+    "SLDDE_DUMP_PATH": "/opt/safelog/bin/sldde-dump",
     "STORAGE_PROBE_DEVICE": "/dev/mmcblk0",
     "AGENT_UPDATE_STATE_PATH": "/var/lib/agv-monitor/agent-update-state.json",
     # This only stages boot-time crash capture.  It never reboots the vehicle.
@@ -147,8 +146,6 @@ def load_config() -> dict[str, str]:
             raise ValueError(f"{key} must be greater than zero")
     if int(config["MAX_SPOOL_SAMPLES"]) <= 0:
         raise ValueError("MAX_SPOOL_SAMPLES must be greater than zero")
-    if not 1 <= int(config["HACO_READ_ONLY_PORT"]) <= 65535:
-        raise ValueError("HACO_READ_ONLY_PORT must be a valid TCP port")
     if int(config["SNAPSHOT_LOG_RETENTION_DAYS"]) <= 0:
         raise ValueError("SNAPSHOT_LOG_RETENTION_DAYS must be greater than zero")
     for _label, (_metric, threshold_key) in SNAPSHOT_METRICS.items():
@@ -1039,38 +1036,25 @@ def crash_capture_status() -> dict[str, object]:
     }
 
 
-def haco_battery_event(config: dict[str, str]) -> dict[str, object] | None:
-    """Read one BMS event from HACO's documented local read-only endpoint."""
-    request = {
-        "command_id": "agv-monitor-battery",
-        "command_type": "command_request_events",
-        "command_request_events": {
-            "requested_events": ["event_battery_status"],
-            "trigger": "single",
-        }
-    }
+def bms_state_of_charge(config: dict[str, str]) -> float | None:
+    """Read SafeLog's retained `storage` BMS state without controlling the AGV."""
     try:
-        with socket.create_connection(
-            (config["HACO_READ_ONLY_HOST"], int(config["HACO_READ_ONLY_PORT"])), timeout=1.0
-        ) as connection:
-            connection.settimeout(1.0)
-            connection.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
-            decoder, buffer = json.JSONDecoder(), ""
-            deadline = time.monotonic() + 1.0
-            while time.monotonic() < deadline:
-                buffer += connection.recv(4096).decode("utf-8", errors="replace")
-                while buffer.lstrip():
-                    buffer = buffer.lstrip()
-                    try:
-                        message, position = decoder.raw_decode(buffer)
-                    except json.JSONDecodeError:
-                        break
-                    buffer = buffer[position:]
-                    event = message.get("event_battery_status") if isinstance(message, dict) else None
-                    if isinstance(event, dict):
-                        return event
-    except (OSError, ValueError, json.JSONDecodeError) as error:
-        LOG.debug("Unable to read HACO battery status: %s", error)
+        process = subprocess.Popen(
+            [config["SLDDE_DUMP_PATH"], "--topic-id", "storage", "--topic-type", "sldde::msg::sensors::BmsState"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        try:
+            output, _ = process.communicate(timeout=1.5)
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            output, _ = process.communicate()
+            output = (error.output or "") + (output or "")
+        match = re.search(r"stateOfCharge:\s*(-?\d+(?:\.\d+)?)", output or "")
+        if match:
+            value = float(match.group(1))
+            return value if 0 <= value <= 100 else None
+    except (OSError, ValueError) as error:
+        LOG.debug("Unable to read SafeLog BMS status: %s", error)
     return None
 
 
@@ -1079,17 +1063,12 @@ def battery_status(config: dict[str, str]) -> dict[str, object]:
     now = time.monotonic()
     interval = max(1.0, float(config["BATTERY_STATUS_INTERVAL_SECONDS"]))
     if now - float(BATTERY_CACHE["updated_at"]) >= interval:
-        event = haco_battery_event(config)
+        state_of_charge = bms_state_of_charge(config)
         previous = BATTERY_CACHE.get("value", {})
-        if event:
+        if state_of_charge is not None:
             BATTERY_CACHE["value"] = {
                 "available": True,
-                "state_of_charge_pct": event.get("state_of_charge"),
-                "voltage_v": event.get("voltage"),
-                "current_a": event.get("current"),
-                "temperature_c": event.get("temperature"),
-                "state_of_health_pct": event.get("state_of_health"),
-                "errors": event.get("errors", []),
+                "state_of_charge_pct": state_of_charge,
             }
         else:
             BATTERY_CACHE["value"] = {**previous, "available": False}
