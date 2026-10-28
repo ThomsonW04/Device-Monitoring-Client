@@ -29,7 +29,7 @@ from urllib.request import Request, urlopen
 
 # All device-specific settings belong in the EnvironmentFile specified here.
 CONFIG_PATH = Path(os.environ.get("AGV_MONITOR_CONFIG", "/etc/agv-monitor/telemetry.conf"))
-AGENT_VERSION = "1.4.2"
+AGENT_VERSION = "1.4.3"
 DEFAULTS = {
     "SERVER_URL": "https://10.54.168.27:5001/api/v1/telemetry",
     "DEVICE_TOKEN": "",
@@ -558,6 +558,12 @@ def agent_update_status_url(server_url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, "/api/v1/agent-update/status", "", ""))
 
 
+def agent_version_key(value: str) -> tuple[int, ...] | None:
+    """Parse the numeric agent versions supported by the update API."""
+    match = re.fullmatch(r"v?(\d+(?:\.\d+){1,3})", value.strip())
+    return tuple(int(part) for part in match.group(1).split(".")) if match else None
+
+
 def agent_update_state_path(config: dict[str, str]) -> Path:
     return Path(config["AGENT_UPDATE_STATE_PATH"])
 
@@ -650,6 +656,15 @@ def install_agent_update(config: dict[str, str], payload: dict[str, object]) -> 
         LOG.error(error)
         update_status(config, "failed", AGENT_VERSION, str(target_version or "unknown"), error)
         return False
+    target_key, current_key = agent_version_key(target_version), agent_version_key(AGENT_VERSION)
+    if target_key is None or current_key is None:
+        error = "Server returned an invalid agent version"
+        LOG.error(error)
+        update_status(config, "failed", AGENT_VERSION, target_version, error)
+        return False
+    if target_key <= current_key:
+        LOG.info("Ignoring non-newer telemetry-agent update %s (current version is %s)", target_version, AGENT_VERSION)
+        return False
     if not same_server_origin(config["SERVER_URL"], download_url):
         error = "Server returned an agent download URL outside the configured server origin"
         LOG.error(error)
@@ -665,6 +680,8 @@ def install_agent_update(config: dict[str, str], payload: dict[str, object]) -> 
             content = response.read()
         if hashlib.sha256(content).hexdigest() != expected_sha256.lower():
             raise ValueError("download SHA-256 does not match the server response")
+        if b"\r\n" in content:
+            raise ValueError("downloaded agent uses CRLF line endings")
         text = content.decode("utf-8")
         version_match = re.search(r'^AGENT_VERSION\s*=\s*["\']([^"\']+)["\']\s*$', text, re.MULTILINE)
         if version_match is None or version_match.group(1) != target_version:
