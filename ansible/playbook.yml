@@ -1,0 +1,205 @@
+---
+- name: Install and maintain AGV Monitoring devices
+  hosts: agv_monitor_devices
+  become: true
+  gather_facts: true
+  vars:
+    agv_monitor_server_url: https://10.54.168.27:5001/api/v1/telemetry
+    agv_monitor_syslog_host: 10.54.168.27
+    agv_monitor_syslog_port: 5001
+    agv_monitor_sample_interval_seconds: 5
+    agv_monitor_upload_interval_seconds: 300
+    agv_monitor_disk_path: /
+    agv_monitor_max_spool_samples: 120960
+    agv_monitor_http_timeout_seconds: 20
+    # AWX/Automation Controller custom credentials inject these environment
+    # variables.  Extra vars or vaulted inventory variables can override them.
+    agv_monitor_admin_username: "{{ lookup('ansible.builtin.env', 'AGV_MONITOR_ADMIN_USERNAME') }}"
+    agv_monitor_admin_password: "{{ lookup('ansible.builtin.env', 'AGV_MONITOR_ADMIN_PASSWORD') }}"
+    agv_monitor_device_name: "{{ inventory_hostname }}"
+    agv_monitor_device_ip: "{{ ansible_host | default(ansible_default_ipv4.address) }}"
+    agv_monitor_config_path: /etc/agv-monitor/telemetry.conf
+
+  handlers:
+    - name: Update trusted CA certificates
+      ansible.builtin.command: update-ca-certificates
+      changed_when: false
+
+    - name: Restart AGV monitor
+      ansible.builtin.systemd_service:
+        name: agv-monitor.service
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart rsyslog
+      ansible.builtin.systemd_service:
+        name: rsyslog.service
+        state: restarted
+
+  tasks:
+    - name: Install runtime dependencies
+      ansible.builtin.package:
+        name:
+          - ca-certificates
+          - rsyslog
+        state: present
+
+    - name: Install the AGV Monitoring certificate authority
+      ansible.builtin.copy:
+        src: files/agv-monitor-ca.crt
+        dest: /usr/local/share/ca-certificates/agv-monitor-ca.crt
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Update trusted CA certificates
+
+    - name: Activate the monitoring certificate authority before registration
+      ansible.builtin.meta: flush_handlers
+
+    - name: Create AGV Monitoring directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: /etc/agv-monitor, mode: '0750' }
+        - { path: /var/lib/agv-monitor, mode: '0750' }
+        - { path: /usr/local/lib/agv-monitor, mode: '0755' }
+
+    - name: Read any existing device configuration
+      ansible.builtin.slurp:
+        src: "{{ agv_monitor_config_path }}"
+      register: agv_monitor_existing_config
+      failed_when: false
+      changed_when: false
+      no_log: true
+
+    - name: Determine whether this device already has a token
+      ansible.builtin.set_fact:
+        agv_monitor_existing_token: >-
+          {{ (agv_monitor_existing_config.content | default('') | b64decode |
+              regex_findall('(?m)^DEVICE_TOKEN=(.+)$') | first) | default('') }}
+      no_log: true
+
+    - name: Require registration credentials only for unregistered devices
+      ansible.builtin.assert:
+        that:
+          - agv_monitor_admin_username | length > 0
+          - agv_monitor_admin_password | length > 0
+        fail_msg: >-
+          This device has no DEVICE_TOKEN. Set AGV_MONITOR_ADMIN_USERNAME and
+          AGV_MONITOR_ADMIN_PASSWORD through an AWX credential, Ansible Vault,
+          or protected extra vars before registering it.
+      when: agv_monitor_existing_token | length == 0
+      no_log: true
+
+    - name: Create the telemetry configuration if absent
+      ansible.builtin.file:
+        path: "{{ agv_monitor_config_path }}"
+        state: touch
+        owner: root
+        group: root
+        mode: '0600'
+        modification_time: preserve
+        access_time: preserve
+
+    - name: Enforce telemetry configuration defaults without replacing tokens
+      ansible.builtin.lineinfile:
+        path: "{{ agv_monitor_config_path }}"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        create: true
+        owner: root
+        group: root
+        mode: '0600'
+      loop:
+        - { key: SERVER_URL, value: "{{ agv_monitor_server_url }}" }
+        - { key: SAMPLE_INTERVAL_SECONDS, value: "{{ agv_monitor_sample_interval_seconds }}" }
+        - { key: INTERNAL_SAMPLE_INTERVAL_SECONDS, value: '0.5' }
+        - { key: UPLOAD_INTERVAL_SECONDS, value: "{{ agv_monitor_upload_interval_seconds }}" }
+        - { key: DISK_PATH, value: "{{ agv_monitor_disk_path }}" }
+        - { key: SPOOL_PATH, value: /var/lib/agv-monitor/telemetry-spool.jsonl }
+        - { key: MAX_SPOOL_SAMPLES, value: "{{ agv_monitor_max_spool_samples }}" }
+        - { key: HTTP_TIMEOUT_SECONDS, value: "{{ agv_monitor_http_timeout_seconds }}" }
+        - { key: SNAPSHOT_CPU_THRESHOLD_PERCENT, value: '95' }
+        - { key: SNAPSHOT_MEMORY_THRESHOLD_PERCENT, value: '95' }
+        - { key: SNAPSHOT_STORAGE_THRESHOLD_PERCENT, value: '90' }
+        - { key: SNAPSHOT_DISK_IO_THRESHOLD_PERCENT, value: '95' }
+        - { key: SNAPSHOT_SWAP_THRESHOLD_PERCENT, value: '95' }
+        - { key: SNAPSHOT_ETH0_THRESHOLD_PERCENT, value: '95' }
+        - { key: SNAPSHOT_TEMPERATURE_THRESHOLD_C, value: '80' }
+        - { key: SNAPSHOT_LOG_RETENTION_DAYS, value: '30' }
+      notify: Restart AGV monitor
+
+    - name: Register only devices with no existing token
+      ansible.builtin.uri:
+        url: "{{ agv_monitor_server_url | regex_replace('/api/v1/telemetry$', '/api/v1/devices/register') }}"
+        method: POST
+        body_format: json
+        body:
+          username: "{{ agv_monitor_admin_username }}"
+          password: "{{ agv_monitor_admin_password }}"
+          name: "{{ agv_monitor_device_name }}"
+          ip_address: "{{ agv_monitor_device_ip }}"
+        status_code: 200
+        return_content: true
+        validate_certs: true
+      register: agv_monitor_registration
+      when: agv_monitor_existing_token | length == 0
+      no_log: true
+
+    - name: Save the registration token
+      ansible.builtin.lineinfile:
+        path: "{{ agv_monitor_config_path }}"
+        regexp: '^DEVICE_TOKEN='
+        line: "DEVICE_TOKEN={{ agv_monitor_registration.json.device_token }}"
+        owner: root
+        group: root
+        mode: '0600'
+      when: agv_monitor_existing_token | length == 0
+      no_log: true
+      notify: Restart AGV monitor
+
+    - name: Install the telemetry agent
+      ansible.builtin.copy:
+        src: ../telemetry_agent.py
+        dest: /usr/local/lib/agv-monitor/telemetry_agent.py
+        owner: root
+        group: root
+        mode: '0755'
+      notify: Restart AGV monitor
+
+    - name: Install the AGV Monitoring service unit
+      ansible.builtin.copy:
+        src: ../agv-monitor.service
+        dest: /etc/systemd/system/agv-monitor.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart AGV monitor
+
+    - name: Enable and start the AGV Monitoring service
+      ansible.builtin.systemd_service:
+        name: agv-monitor.service
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Configure rsyslog UDP forwarding to the monitoring server
+      ansible.builtin.copy:
+        dest: /etc/rsyslog.d/60-agv-monitor-remote.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Managed by Ansible: forward a copy of local syslog over UDP.
+          *.* @{{ agv_monitor_syslog_host }}:{{ agv_monitor_syslog_port }};RSYSLOG_SyslogProtocol23Format
+      notify: Restart rsyslog
+
+    - name: Enable and start rsyslog
+      ansible.builtin.systemd_service:
+        name: rsyslog.service
+        enabled: true
+        state: started

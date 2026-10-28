@@ -1,0 +1,13 @@
+# Non-secret fleet settings.  Copy this file to group_vars/agv_monitor_devices.yml
+# if you need to override a default.
+agv_monitor_server_url: https://10.54.168.27:5001/api/v1/telemetry
+agv_monitor_syslog_host: 10.54.168.27
+agv_monitor_syslog_port: 5001
+agv_monitor_sample_interval_seconds: 5
+agv_monitor_upload_interval_seconds: 300
+agv_monitor_disk_path: /
+agv_monitor_max_spool_samples: 120960
+agv_monitor_http_timeout_seconds: 20
+
+# Do not place credentials in this file.  Use an Ansible Vault variable or the
+# AWX/Automation Controller custom credential described in ansible/README.md.

@@ -1,2 +1,4 @@
 __pycache__/
+ansible/inventory.yml
+ansible/group_vars/agv_monitor_devices.yml
 *.py[cod]

@@ -1,0 +1,14 @@
+all:
+  children:
+    agv_monitor_devices:
+      hosts:
+        agv001:
+          ansible_host: 10.54.192.1
+          # Set this when the IP used to SSH differs from the IP used by the
+          # device for its direct connection to the monitoring server.
+          agv_monitor_device_ip: 10.54.192.1
+          # Optional: defaults to the inventory hostname (agv001).
+          agv_monitor_device_name: AGV001
+      vars:
+        ansible_user: pi
+        ansible_become: true
