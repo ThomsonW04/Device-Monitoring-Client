@@ -29,7 +29,7 @@ from urllib.request import Request, urlopen
 
 # All device-specific settings belong in the EnvironmentFile specified here.
 CONFIG_PATH = Path(os.environ.get("AGV_MONITOR_CONFIG", "/etc/agv-monitor/telemetry.conf"))
-AGENT_VERSION = "1.4.3"
+AGENT_VERSION = "1.4.4"
 DEFAULTS = {
     "SERVER_URL": "https://10.54.168.27:5001/api/v1/telemetry",
     "DEVICE_TOKEN": "",
@@ -56,8 +56,12 @@ DEFAULTS = {
     # This only stages boot-time crash capture.  It never reboots the vehicle.
     "CRASH_CAPTURE_AUTO_ENABLE": "true",
 }
-MAX_BATCH_SIZE = 90  # The server API's explicit maximum.
-MAX_UPLOAD_BYTES = 900_000  # Leave headroom beneath the server's request limit.
+# Keep a bulk catch-up request small enough that it is cheap for both the Pi and
+# the single SQLite writer on the monitor.  The server accepts up to 250 samples.
+MAX_BATCH_SIZE = 250
+MAX_UPLOAD_BYTES = 1_000_000
+MAX_CATCHUP_BATCHES_PER_UPLOAD = 8
+SPOOL_SEGMENT_MAX_BYTES = 1_000_000
 NETWORK_INTERFACES = ("eth0",)
 STOP_REQUESTED = False
 SNAPSHOT_LOG_DIRECTORY = Path("/var/log")
@@ -494,42 +498,102 @@ def collect(
     }, current_cpu, current_processes, current_network, current_disk_io, process_cpu, accounted_cpu
 
 
-def append_sample(spool_path: Path, sample: dict, maximum_samples: int) -> None:
-    spool_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
-    with spool_path.open("a", encoding="utf-8") as spool:
-        spool.write(json.dumps(sample, separators=(",", ":")) + "\n")
+def spool_segment_directory(spool_path: Path) -> Path:
+    return spool_path.with_name(spool_path.name + ".segments")
+
+
+def active_spool_path(spool_path: Path) -> Path:
+    return spool_segment_directory(spool_path) / "active.jsonl"
+
+
+def legacy_spool_path(spool_path: Path) -> Path:
+    """The pre-1.4.4 monolithic spool, drained without rewriting it."""
+    return spool_path
+
+
+def legacy_spool_state_path(spool_path: Path) -> Path:
+    return spool_path.with_name(spool_path.name + ".offset")
+
+
+def append_sample(spool_path: Path, sample: dict, _maximum_samples: int) -> None:
+    """Append only to the active segment; never parse the backlog on collection."""
+    segment_directory = spool_segment_directory(spool_path)
+    segment_directory.mkdir(mode=0o750, parents=True, exist_ok=True)
+    active_path = active_spool_path(spool_path)
+    encoded = (json.dumps(sample, separators=(",", ":")) + "\n").encode("utf-8")
+    if active_path.exists() and active_path.stat().st_size and active_path.stat().st_size + len(encoded) > SPOOL_SEGMENT_MAX_BYTES:
+        rotate_active_spool(spool_path)
+    with active_spool_path(spool_path).open("ab") as spool:
+        spool.write(encoded)
         spool.flush()
         os.fsync(spool.fileno())
-    samples = pending_samples(spool_path)
-    if len(samples) > maximum_samples:
-        LOG.warning("Telemetry spool limit reached; discarding %s oldest samples", len(samples) - maximum_samples)
-        rewrite_spool(spool_path, samples[-maximum_samples:])
 
 
-def pending_samples(spool_path: Path) -> list[dict]:
-    if not spool_path.exists():
+def rotate_active_spool(spool_path: Path) -> Path | None:
+    """Close the current small segment so it can be uploaded then unlinked atomically."""
+    active_path = active_spool_path(spool_path)
+    if not active_path.exists() or not active_path.stat().st_size:
+        return None
+    segment_path = active_path.with_name(f"segment-{time.time_ns()}-{uuid.uuid4().hex}.jsonl")
+    active_path.replace(segment_path)
+    return segment_path
+
+
+def spool_segments(spool_path: Path) -> list[Path]:
+    segment_directory = spool_segment_directory(spool_path)
+    if not segment_directory.exists():
         return []
-    samples = []
-    for line in spool_path.read_text(encoding="utf-8").splitlines():
+    return sorted(segment_directory.glob("segment-*.jsonl"))
+
+
+def read_segment(path: Path) -> list[dict]:
+    samples: list[dict] = []
+    for line in path.read_bytes().splitlines():
         try:
             samples.append(json.loads(line))
         except json.JSONDecodeError:
-            LOG.warning("Ignoring corrupt telemetry spool line")
+            LOG.warning("Ignoring corrupt telemetry spool line in %s", path.name)
     return samples
 
 
-def rewrite_spool(spool_path: Path, samples: list[dict]) -> None:
-    temporary = spool_path.with_suffix(spool_path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as spool:
-        for sample in samples:
-            spool.write(json.dumps(sample, separators=(",", ":")) + "\n")
-        spool.flush()
-        os.fsync(spool.fileno())
-    temporary.replace(spool_path)
+def load_legacy_offset(spool_path: Path) -> int:
+    try:
+        return max(0, int(json.loads(legacy_spool_state_path(spool_path).read_text(encoding="utf-8"))["offset"]))
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return 0
 
 
-def remove_sent_samples(spool_path: Path, count: int) -> None:
-    rewrite_spool(spool_path, pending_samples(spool_path)[count:])
+def save_legacy_offset(spool_path: Path, offset: int) -> None:
+    state_path = legacy_spool_state_path(spool_path)
+    temporary = state_path.with_suffix(state_path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as state_file:
+        json.dump({"offset": offset}, state_file, separators=(",", ":"))
+        state_file.flush()
+        os.fsync(state_file.fileno())
+    temporary.replace(state_path)
+
+
+def read_legacy_batch(spool_path: Path, offset: int) -> tuple[list[dict], int, int]:
+    """Read one bounded batch from a legacy spool, returning its next byte offset."""
+    file_size = spool_path.stat().st_size
+    samples: list[dict] = []
+    with spool_path.open("rb") as spool:
+        spool.seek(min(offset, file_size))
+        while len(samples) < MAX_BATCH_SIZE and spool.tell() < file_size:
+            line = spool.readline()
+            if not line:
+                break
+            try:
+                sample = json.loads(line)
+            except json.JSONDecodeError:
+                LOG.warning("Ignoring corrupt telemetry spool line in legacy spool")
+                continue
+            candidate = samples + [sample]
+            if samples and len(json.dumps({"batch_id": str(uuid.uuid4()), "samples": candidate}).encode()) > MAX_UPLOAD_BYTES:
+                spool.seek(-len(line), os.SEEK_CUR)
+                break
+            samples = candidate
+        return samples, spool.tell(), file_size
 
 
 def snapshot_thresholds(config: dict[str, str]) -> dict[str, float]:
@@ -1321,53 +1385,83 @@ def write_snapshot(
     return None
 
 
-def upload(config: dict[str, str]) -> bool:
-    spool_path = Path(config["SPOOL_PATH"])
-    while queued := pending_samples(spool_path):
-        samples: list[dict] = []
-        for sample in queued[:MAX_BATCH_SIZE]:
-            candidate = samples + [sample]
-            if samples and len(json.dumps({"batch_id": str(uuid.uuid4()), "samples": candidate}).encode()) > MAX_UPLOAD_BYTES:
-                break
-            samples = candidate
-        payload = json.dumps({"batch_id": str(uuid.uuid4()), "samples": samples}).encode()
-        request = Request(
-            config["SERVER_URL"], payload,
-            headers={"Authorization": "Bearer " + config["DEVICE_TOKEN"], "Content-Type": "application/json"},
-            method="POST",
+def send_telemetry_batch(config: dict[str, str], samples: list[dict]) -> bool:
+    """Send one already-bounded batch and apply the acknowledged server state."""
+    payload = json.dumps({"batch_id": str(uuid.uuid4()), "samples": samples}).encode()
+    request = Request(
+        config["SERVER_URL"], payload,
+        headers={"Authorization": "Bearer " + config["DEVICE_TOKEN"], "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=float(config["HTTP_TIMEOUT_SECONDS"])) as response:
+            if response.status != 202:
+                raise OSError(f"unexpected HTTP status {response.status}")
+            response_payload = json.loads(response.read().decode("utf-8") or "{}")
+    except HTTPError as error:
+        LOG.error("Telemetry upload rejected: HTTP %s", error.code)
+        return False
+    except (URLError, OSError) as error:
+        LOG.warning("Telemetry upload deferred: %s", error)
+        return False
+    LOG.info("Uploaded %s telemetry samples", len(samples))
+    update_directive = response_payload.get("agent_update", {})
+    apply_server_directives(config, response_payload)
+    if isinstance(update_directive, dict) and update_directive.get("available"):
+        LOG.info(
+            "Server reports telemetry-agent %s is available; checking update now",
+            update_directive.get("latest_version", "newer"),
         )
-        try:
-            with urlopen(request, timeout=float(config["HTTP_TIMEOUT_SECONDS"])) as response:
-                if response.status != 202:
-                    raise OSError(f"unexpected HTTP status {response.status}")
-                response_payload = json.loads(response.read().decode("utf-8") or "{}")
-            remove_sent_samples(spool_path, len(samples))
-            LOG.info("Uploaded %s telemetry samples", len(samples))
-            update_directive = response_payload.get("agent_update", {})
-            apply_server_directives(config, response_payload)
-            if isinstance(update_directive, dict) and update_directive.get("available"):
-                LOG.info(
-                    "Server reports telemetry-agent %s is available; checking update now",
-                    update_directive.get("latest_version", "newer"),
-                )
-                install_agent_update(config, update_directive)
-        except HTTPError as error:
-            if error.code == 413 and len(samples) > 1:
-                LOG.warning("Telemetry batch exceeded server limit; retrying with one sample")
-                payload = json.dumps({"batch_id": str(uuid.uuid4()), "samples": [samples[0]]}).encode()
-                request = Request(config["SERVER_URL"], payload, headers={"Authorization": "Bearer " + config["DEVICE_TOKEN"], "Content-Type": "application/json"}, method="POST")
-                try:
-                    with urlopen(request, timeout=float(config["HTTP_TIMEOUT_SECONDS"])) as response:
-                        if response.status != 202: raise OSError(f"unexpected HTTP status {response.status}")
-                    remove_sent_samples(spool_path, 1)
-                    continue
-                except (HTTPError, URLError, OSError):
-                    pass
-            LOG.error("Telemetry upload rejected: HTTP %s", error.code)
+        install_agent_update(config, update_directive)
+    return True
+
+
+def upload(config: dict[str, str]) -> bool:
+    """Drain a bounded amount of telemetry without repeatedly rewriting a backlog."""
+    spool_path = Path(config["SPOOL_PATH"])
+    sent_batches = 0
+
+    # Upload the newest data first, so a historic recovery never makes the
+    # dashboard stale.  A successful segment is deleted rather than compacted.
+    current_segment = rotate_active_spool(spool_path)
+    if current_segment is not None:
+        samples = read_segment(current_segment)
+        if samples and not send_telemetry_batch(config, samples):
             return False
-        except (URLError, OSError) as error:
-            LOG.warning("Telemetry upload deferred: %s", error)
+        current_segment.unlink(missing_ok=True)
+        sent_batches += 1
+
+    # Existing 1.4.3 queues can be hundreds of MiB.  Preserve them in place and
+    # advance a durable byte offset only after each acknowledged request.
+    legacy_path = legacy_spool_path(spool_path)
+    while not STOP_REQUESTED and legacy_path.exists() and sent_batches < MAX_CATCHUP_BATCHES_PER_UPLOAD:
+        offset = load_legacy_offset(spool_path)
+        samples, next_offset, file_size = read_legacy_batch(legacy_path, offset)
+        if not samples:
+            if next_offset >= file_size:
+                legacy_path.unlink(missing_ok=True)
+                legacy_spool_state_path(spool_path).unlink(missing_ok=True)
+                break
+            save_legacy_offset(spool_path, next_offset)
+            continue
+        if not send_telemetry_batch(config, samples):
             return False
+        save_legacy_offset(spool_path, next_offset)
+        sent_batches += 1
+        if next_offset >= file_size:
+            legacy_path.unlink(missing_ok=True)
+            legacy_spool_state_path(spool_path).unlink(missing_ok=True)
+
+    # Drain normal completed segments after legacy recovery, without allowing a
+    # single wake-up to monopolise CPU, disk, or the server's SQLite writer.
+    for segment_path in spool_segments(spool_path):
+        if STOP_REQUESTED or sent_batches >= MAX_CATCHUP_BATCHES_PER_UPLOAD:
+            break
+        samples = read_segment(segment_path)
+        if samples and not send_telemetry_batch(config, samples):
+            return False
+        segment_path.unlink(missing_ok=True)
+        sent_batches += 1
     return True
 
 

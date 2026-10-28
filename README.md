@@ -2,7 +2,7 @@
 
 A dependency-free Python 3 systemd daemon for Linux/Raspberry Pi. It samples CPU, memory, swap use, system uptime, root storage use, disk read/write active time, CPU temperature, 1-minute load, and `eth0` network utilisation every five seconds, then uploads a batch every five minutes. Disk read/write active time is the percentage of the sample interval that the device was busy serving I/O, equivalent to Task Manager's disk active-time view. Network utilisation is combined receive/send traffic as a percentage of the interface's negotiated link speed. It also reports eth0's physical carrier state, allowing the server to alert when its cable or interface goes down. Unsent readings are stored in `/var/lib/agv-monitor/` and retry after networking/server failures.
 
-The five-second default is intentional: it produces 60 samples per five-minute upload. The server accepts up to 90 samples, leaving 50% headroom for a delayed upload.
+The five-second default is intentional: it produces 60 samples per five-minute upload. The server accepts up to 250 samples. New queues are written as small durable segments; each upload wake-up drains at most eight 1 MB segments, so a long outage cannot make the agent repeatedly rewrite its entire backlog.
 
 After a daemon start, the first upload occurs after the second sample (five
 seconds with the default configuration). This gives CPU and network utilisation
@@ -107,4 +107,4 @@ sudo systemctl status agv-monitor
 
 The service has no third-party dependencies and runs as root only because the unit's filesystem hardening requires root-managed configuration, state, and diagnostic log directories. The process reads `/proc` and `/sys`, writes its queue under `/var/lib/agv-monitor`, and writes high-utilisation snapshots under `/var/log`.
 
-If you change the sampling interval to below five seconds, increase the upload cadence too: the server accepts no more than 90 readings per request. After an outage, the agent drains queued readings in consecutive 90-reading requests once the server is available.
+If you change the sampling interval to below five seconds, increase the upload cadence too: the server accepts no more than 250 readings per request. After an outage, the agent drains no more than eight bounded requests per upload interval, preserving CPU, disk, and server capacity for normal AGV operation.
